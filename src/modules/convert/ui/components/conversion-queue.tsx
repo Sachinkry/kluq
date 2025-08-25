@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
 import { Badge } from "@/components/ui/badge"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { 
   Video, 
   FileText, 
@@ -15,7 +16,8 @@ import {
   Play,
   Pause,
   RotateCcw,
-  Crown
+  Crown,
+  FileText as FileTextIcon
 } from "lucide-react"
 
 interface ConversionItem {
@@ -32,6 +34,7 @@ interface ConversionQueueProps {
   onStartConversion: (id: string) => void
   onRemoveConversion: (id: string) => void
   onConvertAll: () => void
+  onViewTranscript: (id: string) => void
   isPremium?: boolean
 }
 
@@ -40,6 +43,7 @@ export const ConversionQueue = ({
   onStartConversion, 
   onRemoveConversion, 
   onConvertAll,
+  onViewTranscript,
   isPremium = false
 }: ConversionQueueProps) => {
   const getStatusIcon = (status: string) => {
@@ -73,24 +77,29 @@ export const ConversionQueue = ({
         <div className="flex items-center justify-between">
           <CardTitle>Conversion Queue</CardTitle>
           <div className="flex items-center space-x-2">
-            <Button
-              onClick={onConvertAll}
-              size="sm"
-              disabled={!isPremium || pendingConversions.length === 0 || hasProcessing}
-            >
-              <span className="hidden sm:inline">Convert All</span>
-              <span className="sm:hidden">All</span>
-              {!isPremium && (
-                <Crown className="w-3 h-3 ml-1" />
-              )}
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    disabled={true}
+                    variant="outline"
+                  >
+                    <span className=" sm:inline cursor-not-allowed">Convert All</span>
+                    <span className="sm:hidden">All</span>
+                    <Crown className="w-3 h-3 ml-1" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Batch conversion coming in v2!</p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           </div>
         </div>
-        {!isPremium && hasProcessing && (
-          <p className="text-xs text-muted-foreground">
-            Free tier can only process one conversion at a time. Upgrade to Premium for batch processing.
-          </p>
-        )}
+        <p className="text-xs  text-muted-foreground">
+          Currently processing one file at a time. Batch conversion coming soon!
+        </p>
       </CardHeader>
       <CardContent>
         <div className="space-y-3">
@@ -168,6 +177,29 @@ export const ConversionQueue = ({
                     className="text-green-600 border-green-600 hover:bg-green-50 sm:hidden"
                   >
                     <Download className="w-3 h-3" />
+                  </Button>
+                )}
+
+                {conversion.status === 'completed' && (
+                  <Button
+                    onClick={() => onViewTranscript(conversion.id)}
+                    size="sm"
+                    variant="outline"
+                    className="text-blue-600 border-blue-600 hover:bg-blue-50 hidden sm:flex"
+                  >
+                    <FileTextIcon className="w-3 h-3 mr-1" />
+                    Transcript
+                  </Button>
+                )}
+
+                {conversion.status === 'completed' && (
+                  <Button
+                    onClick={() => onViewTranscript(conversion.id)}
+                    size="sm"
+                    variant="outline"
+                    className="text-blue-600 border-blue-600 hover:bg-blue-50 sm:hidden"
+                  >
+                    <FileTextIcon className="w-3 h-3" />
                   </Button>
                 )}
                 

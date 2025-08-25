@@ -7,6 +7,7 @@ import { UrlInputSection } from '../components/url-input-section';
 import { FileUploadSection } from '../components/file-upload-section';
 import { ConversionQueue } from '../components/conversion-queue';
 import { StatsCards } from '../components/stats-cards';
+import { TranscriptModal } from '../components/transcript-modal';
 
 interface ConversionItem {
   id: string;
@@ -22,6 +23,17 @@ export const ConvertView = () => {
   const [urlInput, setUrlInput] = useState('');
   const [conversions, setConversions] = useState<ConversionItem[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [transcriptModal, setTranscriptModal] = useState<{
+    isOpen: boolean;
+    conversionId: string;
+    conversionName: string;
+    conversionType: 'url' | 'file';
+  }>({
+    isOpen: false,
+    conversionId: '',
+    conversionName: '',
+    conversionType: 'url'
+  });
   
   // TODO: Get user's premium status from auth/context
   const isPremium = false; // This should come from user context
@@ -123,6 +135,18 @@ export const ConvertView = () => {
     });
   };
 
+  const handleViewTranscript = (id: string) => {
+    const conversion = conversions.find(conv => conv.id === id);
+    if (conversion) {
+      setTranscriptModal({
+        isOpen: true,
+        conversionId: id,
+        conversionName: conversion.name,
+        conversionType: conversion.type
+      });
+    }
+  };
+
   return (
     <div className="flex-1 p-6 bg-background">
       <div className="max-w-4xl mx-auto space-y-6">
@@ -167,7 +191,17 @@ export const ConvertView = () => {
           onStartConversion={startConversion}
           onRemoveConversion={removeConversion}
           onConvertAll={convertAll}
+          onViewTranscript={handleViewTranscript}
           isPremium={isPremium}
+        />
+
+        {/* Transcript Modal */}
+        <TranscriptModal
+          isOpen={transcriptModal.isOpen}
+          onClose={() => setTranscriptModal(prev => ({ ...prev, isOpen: false }))}
+          conversionId={transcriptModal.conversionId}
+          conversionName={transcriptModal.conversionName}
+          conversionType={transcriptModal.conversionType}
         />
 
         {/* Quick Stats */}
