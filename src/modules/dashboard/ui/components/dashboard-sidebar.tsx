@@ -22,9 +22,9 @@ import { DashboardUserButton } from "./dashboard-user-button"
 
 const firstSection = [
     {
-        icon: Zap,
-        label: "Convert",
-        href: "/convert",
+        icon: HomeIcon,
+        label: "Home",
+        href: "/",
     },
     {
         icon: FileIcon,

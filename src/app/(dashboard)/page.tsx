@@ -13,7 +13,7 @@ const Page = async () => {
 
   // Redirect to convert page as the default
   // return <HomeView />
-  redirect("/convert")
+  redirect("/chat")
 
 }
 

@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, boolean, } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, uuid, vector, index, } from "drizzle-orm/pg-core";
 
 export const user = pgTable("user", {
     id: text('id').primaryKey(),
@@ -45,3 +45,23 @@ export const verification = pgTable("verification", {
     createdAt: timestamp('created_at').$defaultFn(() => /* @__PURE__ */ new Date()),
     updatedAt: timestamp('updated_at').$defaultFn(() => /* @__PURE__ */ new Date())
 });
+
+export const papers = pgTable("papers", {
+    id: text("id").primaryKey(),
+    title: text("title").notNull(),
+    abstract: text("abstract"),
+    pdfUrl: text("pdf_url"),
+    pdfData: text("pdf_data"), // Base64 encoded PDF as fallback when Redis is not available
+    fileHash: text("file_hash"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  });
+  
+  export const paperChunks = pgTable("paper_chunks", {
+    id: uuid("id").defaultRandom().primaryKey(),
+    paperId: text("paper_id").references(() => papers.id, { onDelete: "cascade" }).notNull(),
+    content: text("content").notNull(),
+    // Jina v3 default dimension is 1024
+    embedding: vector("embedding", { dimensions: 1024 }), 
+  }, (table) => ({
+    embeddingIndex: index("embeddingIndex").using("hnsw", table.embedding.op("vector_cosine_ops")),
+  }));
