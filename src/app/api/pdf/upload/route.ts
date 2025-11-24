@@ -4,15 +4,22 @@ export const runtime = "nodejs";
 import { NextResponse } from "next/server";
 import { db } from "@/db";
 import { papers, paperChunks } from "@/db/schema";
-import { eq } from "drizzle-orm"; 
+import { eq, and } from "drizzle-orm"; 
 import { extractPdfText } from "@/lib/extract-pdf";
 import { recursiveChunkText } from "@/lib/pdf-loader";
 import { generateEmbeddings } from "@/lib/embed";
 import { randomUUID, createHash } from "crypto"; // Import createHash
 import { redis, ensureRedis } from "@/lib/redis";
+import { auth } from "@/lib/auth";
+import { headers } from "next/headers";
+import { chats } from "@/db/schema";
+import { generateStructuredSummary } from "@/lib/summarize";
 
 export async function POST(req: Request) {
   try {
+    const session = await auth.api.getSession({ headers: await headers() });
+    if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const formData = await req.formData();
     const file = formData.get("file") as File;
 
@@ -62,12 +69,23 @@ export async function POST(req: Request) {
     console.log(`[Upload API] Extracting text from PDF: ${fileName}`);
     const fullText = await extractPdfText(buffer);
 
+    // --- DEBUG: VIEW PARSING QUALITY ---
+    console.log("============== RAW PDF TEXT START ==============");
+    console.log(fullText.slice(0, 2000)); // Print first 2000 chars
+    console.log("============== RAW PDF TEXT END ==============");
+    // -----------------------------------
+
     if (fullText.length === 0) {
       return NextResponse.json(
         { error: "Could not extract text from PDF" },
         { status: 400 }
       );
     }
+
+    console.log(`[Upload API] Generating structured summary...`);
+    const aiSummary = await generateStructuredSummary(fullText);
+    console.log(`[Upload API] Structured summary generated: ${aiSummary}`);
+    const fallbackAbstract = fullText.slice(0, 500) + "...";
 
     // 4. Save New Paper
     const pdfId = randomUUID();
@@ -88,7 +106,8 @@ export async function POST(req: Request) {
       id: pdfId,
       title: fileName || "Untitled Document",
       pdfUrl: `/api/pdf/serve?pdfId=${pdfId}`, 
-      abstract: fullText.substring(0, 500), 
+      abstract: fallbackAbstract,
+      summary: aiSummary,
       pdfData: storedInRedis ? null : base64,
       fileHash: fileHash, // Save the hash!
     });
@@ -113,6 +132,18 @@ export async function POST(req: Request) {
     }
 
     console.log(`[Upload API] Successfully processed PDF: ${pdfId}`);
+
+    const existingChat = await db.select().from(chats)
+      .where(and(eq(chats.userId, session.user.id), eq(chats.paperId, pdfId))) // pdfId is the UUID you generated
+      .limit(1);
+
+    if (existingChat.length === 0) {
+      await db.insert(chats).values({
+        userId: session.user.id,
+        paperId: pdfId,
+        title: "New Conversation",
+      });
+    }
     return NextResponse.json({
       success: true,
       pdfId: pdfId,

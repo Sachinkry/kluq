@@ -26,6 +26,7 @@ export async function GET(req: Request) {
       id: paper[0].id,
       title: paper[0].title,
       abstract: paper[0].abstract,
+      summary: paper[0].summary,
       pdfUrl: paper[0].pdfUrl,
       createdAt: paper[0].createdAt,
     });

@@ -47,6 +47,8 @@ public/
   next.svg
   vercel.svg
   window.svg
+python-service/
+  server.py
 src/
   app/
     (auth)/
@@ -69,6 +71,12 @@ src/
     api/
       auth/
         [...all]/
+          route.ts
+      chat/
+        history/
+          route.ts
+      history/
+        sidebar/
           route.ts
       pdf/
         chat/
@@ -149,11 +157,14 @@ src/
     auth-client.ts
     auth.ts
     chunk.ts
+    curated-papers.ts
     embed.ts
     extract-pdf.ts
+    grouped-history.tsx
     memory-store.ts
     pdf-loader.ts
     redis.ts
+    summarize.ts
     utils.ts
   modules/
     auth/
@@ -161,7 +172,20 @@ src/
         views/
           sign-in-view.tsx
           sign-up-view.tsx
+    chat/
+      hooks/
+        use-chat.ts
+      ui/
+        components/
+          chat-input.tsx
+          message-list.tsx
+          pdf-viewer.tsx
+          research-summary.tsx
+        views/
+          chat-view.tsx
     dashboard/
+      context/
+        header-context.tsx
       ui/
         components/
           dashboard-command.tsx
@@ -171,6 +195,7 @@ src/
     search/
       ui/
         components/
+          curated-topics.tsx
           paper-card.tsx
         views/
           search-view.tsx
@@ -195,41 +220,432 @@ tsconfig.json
 <files>
 This section contains the contents of the repository's files.
 
-<file path="src/app/(dashboard)/chat/[id]/page.tsx">
-"use client";
+<file path="python-service/server.py">
+# python-service/server.py
+from fastapi import FastAPI, UploadFile, File
+from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import DocumentStream  # <--- IMPORT THIS
+import uvicorn
+import io
 
-import { useEffect, useState, useRef } from "react";
-import { useParams } from "next/navigation";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Send, Loader2 } from "lucide-react";
+app = FastAPI()
+converter = DocumentConverter()
 
-type ChatMessage = {
+@app.post("/parse")
+async def parse_pdf(file: UploadFile = File(...)):
+    # Read file to buffer
+    content = await file.read()
+    
+    # FIX: Wrap BytesIO in DocumentStream with a filename
+    # Docling uses the filename extension (e.g., .pdf) to determine the format
+    buf = io.BytesIO(content)
+    source = DocumentStream(name=file.filename or "document.pdf", stream=buf)
+    
+    # Convert using the wrapped source
+    result = converter.convert(source)
+    
+    # Export to Markdown
+    md_output = result.document.export_to_markdown()
+    
+    return {"text": md_output}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+</file>
+
+<file path="src/app/api/chat/history/route.ts">
+import { NextResponse } from "next/server";
+import { db } from "@/db";
+import { chats, messages } from "@/db/schema";
+import { eq, and, asc } from "drizzle-orm";
+import { auth } from "@/lib/auth"; // Adjust path if needed
+import { headers } from "next/headers";
+
+export async function GET(req: Request) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const paperId = searchParams.get("paperId");
+
+    if (!paperId) {
+      return NextResponse.json({ error: "Missing paperId" }, { status: 400 });
+    }
+
+    // 1. Get Current User
+    const session = await auth.api.getSession({
+      headers: await headers(),
+    });
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    // 2. Find the Chat ID for this User + Paper
+    const chat = await db
+      .select()
+      .from(chats)
+      .where(and(
+        eq(chats.userId, session.user.id),
+        eq(chats.paperId, paperId)
+      ))
+      .limit(1);
+
+    if (chat.length === 0) {
+      return NextResponse.json({ messages: [] });
+    }
+
+    // 3. Fetch Messages
+    const history = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.chatId, chat[0].id))
+      .orderBy(asc(messages.createdAt));
+
+    return NextResponse.json({ messages: history });
+
+  } catch (error: any) {
+    console.error("[History API] Error:", error);
+    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
+  }
+}
+</file>
+
+<file path="src/app/api/history/sidebar/route.ts">
+export const dynamic = "force-dynamic"; // <--- ADD THIS to disable caching
+
+import { NextResponse } from "next/server";
+import { db } from "@/db";
+import { chats, papers } from "@/db/schema";
+import { eq, desc } from "drizzle-orm";
+import { auth } from "@/lib/auth";
+import { headers } from "next/headers";
+
+export async function GET(req: Request) {
+  try {
+    const session = await auth.api.getSession({
+      headers: await headers(),
+    });
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const history = await db
+      .select({
+        chatId: chats.id,
+        title: chats.title,
+        paperId: papers.id,
+        paperTitle: papers.title,
+        createdAt: chats.createdAt
+      })
+      .from(chats)
+      .innerJoin(papers, eq(chats.paperId, papers.id))
+      .where(eq(chats.userId, session.user.id))
+      .orderBy(desc(chats.createdAt));
+
+    return NextResponse.json({ history });
+
+  } catch (error: any) {
+    console.error("[Sidebar History API] Error:", error);
+    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
+  }
+}
+</file>
+
+<file path="src/lib/curated-papers.ts">
+// src/lib/curated-papers.ts
+import { Paper } from "@/modules/search/ui/components/paper-card";
+
+export const CURATED_TOPICS = [
+  "Transformers",
+  "Diffusion",
+  "Vision",
+  "TTS",
+  "Fine-Tuning",
+  "Evaluations",
+  "RL",
+  "RLHF",
+] as const;
+
+export type CuratedCategory = typeof CURATED_TOPICS[number];
+
+// Removed 'summary' param and field
+const createPaper = (id: string, title: string, authors: string, year: string, category: string, descriptionContext: string): Paper => ({
+    id,
+    title,
+    authors,
+    published: year,
+    categories: [category, "cs.AI"],
+    pdfUrl: `https://arxiv.org/pdf/${id}.pdf`,
+    // Using the context provided to generate a pseudo-abstract for the curated list
+    abstract: `${descriptionContext} This seminal paper introduces novel techniques in ${category} that have become foundational to modern AI research.`
+});
+
+export const CURATED_PAPERS: Record<CuratedCategory, Paper[]> = {
+  Transformers: [
+    createPaper("1706.03762", "Attention Is All You Need", "Vaswani et al.", "2017", "cs.CL", 
+        "Proposed the Transformer architecture, replacing RNNs with self-attention mechanisms."),
+    createPaper("1810.04805", "BERT: Pre-training of Deep Bidirectional Transformers", "Devlin et al.", "2018", "cs.CL",
+        "Introduced bidirectional training of Transformer encoders using Masked Language Modeling."),
+    createPaper("2005.14165", "Language Models are Few-Shot Learners (GPT-3)", "Brown et al.", "2020", "cs.CL", 
+        "Demonstrated that scaling up language models to 175B parameters dramatically improves few-shot performance."),
+  ],
+  Diffusion: [
+    createPaper("2006.11239", "Denoising Diffusion Probabilistic Models (DDPM)", "Ho et al.", "2020", "cs.CV", 
+        "Revived diffusion models by showing they could generate high-quality images matching GAN performance."),
+    createPaper("2112.10752", "High-Resolution Image Synthesis with Latent Diffusion Models", "Rombach et al.", "2021", "cs.CV", 
+        "Introduced Stable Diffusion by applying diffusion in a compressed latent space."),
+  ],
+  Vision: [
+    createPaper("2010.11929", "An Image is Worth 16x16 Words (ViT)", "Dosovitskiy et al.", "2020", "cs.CV", 
+        "Applied the pure Transformer architecture directly to image patches."),
+    createPaper("1512.03385", "Deep Residual Learning for Image Recognition (ResNet)", "He et al.", "2015", "cs.CV", 
+        "Introduced skip connections (residual blocks) to train extremely deep networks."),
+  ],
+  TTS: [
+    createPaper("2301.02111", "Neural Codec Language Models are Zero-Shot Text to Speech Synthesizers (VALL-E)", "Wang et al.", "2023", "cs.SD",
+        "Modeled TTS as a language modeling task using audio codec codes."),
+  ],
+  "Fine-Tuning": [
+    createPaper("2106.09685", "LoRA: Low-Rank Adaptation of Large Language Models", "Hu et al.", "2021", "cs.CL", 
+        "Proposed freezing pre-trained weights and injecting trainable rank decomposition matrices."),
+    createPaper("2305.14314", "QLoRA: Efficient Finetuning of Quantized LLMs", "Dettmers et al.", "2023", "cs.LG", 
+        "Combined 4-bit quantization with LoRA for efficient fine-tuning."),
+  ],
+  Evaluations: [
+    createPaper("2009.03300", "Measuring Massive Multitask Language Understanding (MMLU)", "Hendrycks et al.", "2020", "cs.CY", 
+        "Proposed a massive benchmark covering 57 subjects across STEM and humanities."),
+  ],
+  RL: [
+    createPaper("1707.06347", "Proximal Policy Optimization Algorithms (PPO)", "Schulman et al.", "2017", "cs.LG", 
+        "The default RL algorithm used by OpenAI, balancing implementation ease and sample complexity."),
+  ],
+  RLHF: [
+    createPaper("2203.02155", "Training language models to follow instructions (InstructGPT)", "Ouyang et al.", "2022", "cs.CL", 
+        "The paper behind ChatGPT, showing fine-tuning on human feedback aligns models better."),
+  ],
+};
+</file>
+
+<file path="src/lib/grouped-history.tsx">
+import { isToday, isYesterday, subDays, isAfter } from "date-fns";
+
+export type HistoryItem = {
+  chatId: string;
+  title: string;
+  paperId: string;
+  paperTitle: string;
+  createdAt: string; // Ensure your API returns this
+};
+
+export type GroupedHistory = {
+  label: string;
+  items: HistoryItem[];
+};
+
+export function groupChatsByDate(chats: HistoryItem[]): GroupedHistory[] {
+  const groups: Record<string, HistoryItem[]> = {
+    Today: [],
+    Yesterday: [],
+    "Previous 7 Days": [],
+    "Older": [],
+  };
+
+  chats.forEach((chat) => {
+    const date = new Date(chat.createdAt);
+    if (isToday(date)) {
+      groups["Today"].push(chat);
+    } else if (isYesterday(date)) {
+      groups["Yesterday"].push(chat);
+    } else if (isAfter(date, subDays(new Date(), 7))) {
+      groups["Previous 7 Days"].push(chat);
+    } else {
+      groups["Older"].push(chat);
+    }
+  });
+
+  // Convert to array and filter empty groups
+  return Object.entries(groups)
+    .map(([label, items]) => ({ label, items }))
+    .filter((group) => group.items.length > 0);
+}
+</file>
+
+<file path="src/lib/summarize.ts">
+// src/lib/summarize.ts
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { generateText } from "ai";
+
+const google = createGoogleGenerativeAI({
+  apiKey: process.env.GEMINI_API_KEY,
+});
+
+export async function generateStructuredSummary(fullText: string) {
+  // Grab the first 50k characters (~10-12k tokens). 
+  // This usually covers the Abstract, Intro, Methodology, and early Results.
+  // Gemini Flash supports 1M tokens, so we can be generous here.
+  const context = fullText.slice(0, 50000); 
+
+  try {
+    const { text } = await generateText({
+      model: google("gemini-2.5-flash"),
+      system: "You are a senior academic researcher. Synthesize technical papers into structured insights.",
+      prompt: `Analyze the provided research paper text and generate a structured summary in Markdown.
+      
+      Output strictly in this format:
+      **Core Problem:** [What specific gap is this paper trying to fill?]
+      **Methodology:** [Technical approach, architecture, or algorithms used]
+      **Key Results:** [Specific metrics, benchmarks, or discoveries]
+      **Implications:** [Why does this matter?]
+      
+      TEXT TO ANALYZE:
+      ${context}`,
+    });
+    
+    return text;
+  } catch (error) {
+    console.error("Summary generation failed:", error);
+    return "Summary unavailable.";
+  }
+}
+</file>
+
+<file path="src/modules/chat/hooks/use-chat.ts">
+import { useState, useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
+import { useHeader } from "@/modules/dashboard/context/header-context";
+
+export type ChatMessage = {
   role: "user" | "assistant";
   content: string;
 };
 
-export default function ChatWithPaperPage() {
-  const { id } = useParams();
+export function useChat(pdfIdParam: string | string[] | undefined) {
+  const router = useRouter();
+  const { setTitle } = useHeader();
+  
+  // State
   const [pdfId, setPdfId] = useState<string | null>(null);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [pdfTitle, setPdfTitle] = useState<string>("");
+  const [pdfSummary, setPdfSummary] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  // Scroll to bottom helper
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // Cleanup: Remove title when unmounting
+  useEffect(() => {
+    return () => setTitle(null);
+  }, [setTitle]);
+
+  // Load History Helper
+  const fetchHistory = async (paperId: string) => {
+    try {
+      const res = await fetch(`/api/chat/history?paperId=${paperId}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.messages && Array.isArray(data.messages)) {
+            setMessages(data.messages.map((m: any) => ({
+                role: m.role,
+                content: m.content
+            })));
+        }
+      }
+    } catch (err) {
+      console.error("Failed to fetch history", err);
+    }
+  };
+
+  // Initial Load Logic (PDF + Metadata)
+  useEffect(() => {
+    async function load() {
+      if (!pdfIdParam) return;
+      
+      try {
+        const idString = Array.isArray(pdfIdParam) ? pdfIdParam[0] : pdfIdParam;
+        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idString);
+        
+        let activePdfId = idString;
+
+        if (isUUID) {
+          // CASE 1: Direct UUID Load (Refresh or Direct Link)
+          setPdfId(idString);
+          setPdfUrl(`/api/pdf/serve?pdfId=${idString}`);
+          
+          const res = await fetch(`/api/pdf/info?pdfId=${idString}`);
+          if (res.ok) {
+            const data = await res.json();
+            const title = data.title || "Document";
+            
+            setPdfTitle(title);
+            setPdfSummary(data.summary || "");
+            setTitle(title); // <--- Update Global Header
+          }
+        } else {
+           // CASE 2: ArXiv ID Load (From Search)
+           const res = await fetch("/api/pdf/load", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ arxivId: idString }),
+          });
+          
+          if (res.ok) {
+            const data = await res.json();
+            activePdfId = data.pdfId;
+            
+            setPdfId(data.pdfId);
+            setPdfUrl(`/api/pdf/serve?pdfId=${data.pdfId}`);
+            
+            if (data.title) {
+                setPdfTitle(data.title);
+                setTitle(data.title); // <--- Update Global Header
+            }
+            
+            // Fetch fresh summary (since load endpoint might not return full details)
+            const infoRes = await fetch(`/api/pdf/info?pdfId=${data.pdfId}`);
+             if (infoRes.ok) {
+                const infoData = await infoRes.json();
+                setPdfSummary(infoData.summary || ""); 
+             }
+             
+            // Update URL to UUID without reloading page
+            router.replace(`/chat/${data.pdfId}`);
+          }
+        }
+
+        // Load Chat History for this paper
+        if (activePdfId) {
+            await fetchHistory(activePdfId);
+        }
+
+      } catch (error) {
+        console.error("Error loading PDF:", error);
+      } finally {
+        setLoading(false);
+      }
+    }
+    load();
+  }, [pdfIdParam, router, setTitle]);
+
+  // Handle Chat Submit
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || !pdfId || isLoading) return;
+    if (!input.trim() || !pdfId || isStreaming) return;
 
     const userMessage = input.trim();
     setInput("");
-    setIsLoading(true);
+    setIsStreaming(true);
 
-    // Add user message
+    // Optimistic Update
     setMessages((prev) => [...prev, { role: "user", content: userMessage }]);
+    setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
     try {
       const response = await fetch("/api/pdf/chat", {
@@ -244,51 +660,21 @@ export default function ChatWithPaperPage() {
         }),
       });
 
-      if (!response.ok) {
-        throw new Error("Failed to get response");
-      }
+      if (!response.ok) throw new Error(`Chat failed: ${response.statusText}`);
 
-      // Handle streaming response (Vercel AI SDK format)
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
       let assistantMessage = "";
-      let buffer = "";
-
-      // Add empty assistant message
-      setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
       if (reader) {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || ""; // Keep incomplete line in buffer
-
-          for (const line of lines) {
-            if (line.trim() === "") continue;
-            
-            // Vercel AI SDK streaming format: "0:content" or "0:"content"
-            if (line.match(/^\d+:/)) {
-              const text = line.substring(line.indexOf(":") + 1);
-              assistantMessage += text;
-              setMessages((prev) => {
-                const newMessages = [...prev];
-                newMessages[newMessages.length - 1] = {
-                  role: "assistant",
-                  content: assistantMessage,
-                };
-                return newMessages;
-              });
-            }
-          }
-        }
-        
-        // Process any remaining buffer
-        if (buffer.trim()) {
-          const text = buffer.replace(/^\d+:/, "");
-          assistantMessage += text;
+          
+          // Raw text streaming fix
+          const chunk = decoder.decode(value, { stream: true });
+          assistantMessage += chunk;
+          
           setMessages((prev) => {
             const newMessages = [...prev];
             newMessages[newMessages.length - 1] = {
@@ -301,1309 +687,401 @@ export default function ChatWithPaperPage() {
       }
     } catch (error) {
       console.error("Chat error:", error);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "Sorry, I encountered an error. Please try again.",
-        },
-      ]);
+      setMessages((prev) => {
+          const newMessages = [...prev];
+          newMessages[newMessages.length - 1] = { role: "assistant", content: "Error: Could not fetch response." };
+          return newMessages;
+      });
     } finally {
-      setIsLoading(false);
+      setIsStreaming(false);
     }
   };
 
-  useEffect(() => {
-    async function load() {
-      try {
-        // Check if it's a UUID (uploaded PDF) or arxiv ID
-        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id as string);
-        
-        if (isUUID) {
-          // It's an uploaded PDF, serve directly
-          setPdfId(id as string);
-          setPdfUrl(`/api/pdf/serve?pdfId=${id}`);
-          
-          // Try to get title from database
-          const res = await fetch(`/api/pdf/info?pdfId=${id}`);
-          if (res.ok) {
-            const data = await res.json();
-            setPdfTitle(data.title || "Document");
-          }
-        } else {
-          // It's an arxiv ID, load it
-          const res = await fetch(`/api/pdf/load?arxivId=${id}`);
-          if (!res.ok) {
-            console.error("Failed to load PDF");
-            setLoading(false);
-            return;
-          }
-          const data = await res.json();
-          setPdfId(data.pdfId);
-          setPdfUrl(`/api/pdf/serve?pdfId=${data.pdfId}`);
-        }
-      } catch (error) {
-        console.error("Error loading PDF:", error);
-      } finally {
-        setLoading(false);
-      }
-    }
-    load();
-  }, [id]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  return (
-    <div className="grid grid-cols-2 h-screen overflow-hidden bg-white">
-      {/* LEFT - PDF Viewer */}
-      <div className="border-r border-slate-200 overflow-hidden flex flex-col">
-        <div className="border-b border-slate-200 px-4 py-3 bg-slate-50">
-          <h2 className="font-semibold text-slate-900 truncate">
-            {pdfTitle || "PDF Document"}
-          </h2>
-        </div>
-        <div className="flex-1 overflow-auto">
-          {loading ? (
-            <div className="flex items-center justify-center h-full">
-              <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
-            </div>
-          ) : pdfUrl ? (
-            <iframe src={pdfUrl} className="w-full h-full" />
-          ) : (
-            <div className="p-4 text-slate-500">PDF not available</div>
-          )}
-        </div>
-      </div>
-
-      {/* RIGHT - Chat Interface */}
-      <div className="flex flex-col h-full bg-white">
-        <div className="border-b border-slate-200 px-4 py-3 bg-slate-50">
-          <h2 className="font-semibold text-slate-900">Chat</h2>
-        </div>
-
-        <div className="flex-1 overflow-auto p-4 space-y-4">
-          {messages.length === 0 && (
-            <div className="flex items-center justify-center h-full text-center">
-              <div className="text-slate-500">
-                <p className="text-lg font-medium mb-2">Start a conversation</p>
-                <p className="text-sm">
-                  Ask questions about the PDF document
-                </p>
-              </div>
-            </div>
-          )}
-          
-          {messages.map((m, idx) => (
-            <div
-              key={idx}
-              className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-            >
-              <div
-                className={`max-w-[80%] rounded-lg px-4 py-2 ${
-                  m.role === "user"
-                    ? "bg-emerald-600 text-white"
-                    : "bg-slate-100 text-slate-900"
-                }`}
-              >
-                <div className="whitespace-pre-wrap">{m.content}</div>
-              </div>
-            </div>
-          ))}
-          
-          {isLoading && (
-            <div className="flex justify-start">
-              <div className="bg-slate-100 text-slate-900 rounded-lg px-4 py-2">
-                <Loader2 className="w-4 h-4 animate-spin" />
-              </div>
-            </div>
-          )}
-          
-          <div ref={messagesEndRef} />
-        </div>
-
-        <div className="border-t border-slate-200 p-4">
-          <form onSubmit={handleSubmit} className="flex gap-2">
-            <Input
-              placeholder="Ask anything about the document..."
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              disabled={isLoading || !pdfId}
-              className="flex-1"
-            />
-            <Button
-              type="submit"
-              disabled={isLoading || !pdfId || !input.trim()}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white"
-            >
-              {isLoading ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Send className="w-4 h-4" />
-              )}
-            </Button>
-          </form>
-        </div>
-      </div>
-    </div>
-  );
+  return {
+    pdfId,
+    pdfUrl,
+    pdfTitle,
+    pdfSummary,
+    loading,
+    messages,
+    input,
+    setInput,
+    isStreaming,
+    handleSubmit,
+    messagesEndRef
+  };
 }
 </file>
 
-<file path="src/app/(dashboard)/chat/page.tsx">
-"use client";
-
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-import PDFUpload from "@/components/pdf-upload";
-
-export default function ChatLandingPage() {
-  const router = useRouter();
-  const [loading, setLoading] = useState(false);
-
-  async function handlePDFSelect(file: File) {
-    setLoading(true);
-
-    try {
-      const form = new FormData();
-      form.append("file", file);
-
-      const res = await fetch("/api/pdf/upload", {
-        method: "POST",
-        body: form,
-      });
-
-      // Check if response is JSON
-      const contentType = res.headers.get("content-type");
-      if (!contentType || !contentType.includes("application/json")) {
-        const text = await res.text();
-        throw new Error(`Server error: ${res.status} ${res.statusText}`);
-      }
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || "Failed to upload PDF");
-      }
-
-      if (data.pdfId) {
-        router.push(`/chat/${data.pdfId}`);
-      } else {
-        throw new Error("No PDF ID returned from server");
-      }
-    } catch (error: any) {
-      console.error("Upload error:", error);
-      alert(error.message || "Failed to upload PDF. Please try again.");
-      setLoading(false);
-    }
-  }
-
-  return <PDFUpload onPDFSelect={handlePDFSelect} loading={loading} />;
-}
-</file>
-
-<file path="src/app/(dashboard)/research/page.tsx">
-// // src/app/(dashboard)/research/page.tsx
-// export const revalidate = 900 // 15 min
-// export default function ResearchPage() {
-//   return <ResearchFeed />
-// }
-</file>
-
-<file path="src/app/(dashboard)/search/page.tsx">
-"use client";
-
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-import { Input } from "@/components/ui/input";
+<file path="src/modules/chat/ui/components/chat-input.tsx">
+import { Loader2, Send } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 
-export default function SearchPage() {
-  const router = useRouter();
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<any[]>([]);
+interface ChatInputProps {
+  input: string;
+  setInput: (value: string) => void;
+  onSubmit: (e: React.FormEvent) => void;
+  loading: boolean;
+  disabled: boolean;
+}
 
-  // Mock search
-//   function handleSearch() {
-//     if (!query.trim()) return;
-
-//     // Fake results for demo
-//     const mock = [
-//       {
-//         id: "paper-1",
-//         title: "Attention Is All You Need",
-//         authors: "Vaswani et al.",
-//         summary: "Introduced the Transformer architecture which replaced recurrent models.",
-//       },
-//       {
-//         id: "paper-2",
-//         title: "Denoising Diffusion Probabilistic Models",
-//         authors: "Ho et al.",
-//         summary: "Foundation of diffusion models used for generative image synthesis.",
-//       },
-//       {
-//         id: "paper-3",
-//         title: "Chain-of-Thought Reasoning Improves LLM Performance",
-//         authors: "Wei et al.",
-//         summary: "Demonstrated that LLMs benefit from step-by-step reasoning traces.",
-//       },
-//     ];
-
-//     setResults(mock);
-//   }
-
-    async function handleSearch() {
-        if (!query.trim()) return;
-    
-        const res = await fetch(`/api/search/arxiv?q=${encodeURIComponent(query)}`);
-        const data = await res.json();
-
-        console.log(data);
-    
-        setResults(data.results || []);
-    }
-  
+export const ChatInput = ({ input, setInput, onSubmit, loading, disabled }: ChatInputProps) => {
   return (
-    <div className="w-full flex flex-col items-center py-10 px-4">
-      {/* Title */}
-      <h1 className="text-3xl font-bold text-center mb-6">
-        Search Research Papers
-      </h1>
-
-      {/* Search bar */}
-      <div className="w-full max-w-3xl flex items-center gap-3 mb-10">
+    <div className="border-t border-slate-200 p-4 shrink-0 bg-white">
+      <form onSubmit={onSubmit} className="flex gap-2">
         <Input
-          placeholder="Search for transformer, diffusion, agents..."
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          className="h-12 text-lg"
+          placeholder="Ask a specific question..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={loading || disabled}
+          className="flex-1 border-slate-200 focus-visible:ring-emerald-500"
         />
-        <Button
-          size="lg"
-          className="h-12 px-6 bg-primary text-white"
-          onClick={handleSearch}
+        <Button 
+          type="submit" 
+          disabled={loading || disabled || !input.trim()} 
+          className="bg-emerald-600 hover:bg-emerald-700 text-white"
         >
-          Search
+          {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
         </Button>
-      </div>
-
-      {/* Results */}
-      {results.map((paper) => (
-    <Card key={paper.id} className="border border-neutral-200 shadow-sm">
-        <CardHeader>
-        <CardTitle className="text-xl">{paper.title}</CardTitle>
-        <CardDescription>{paper.authors}</CardDescription>
-        </CardHeader>
-
-        <CardContent>
-        <p className="text-neutral-700 mb-4">{paper.summary}</p>
-
-        <div className="flex gap-3">
-            <Button
-            className="bg-green-600 hover:bg-green-700 text-white"
-            onClick={() => router.push(`/chat/${encodeURIComponent(paper.id)}`)}
-            >
-            Chat with this paper
-            </Button>
-
-            {paper.pdfUrl && (
-            <a
-                href={paper.pdfUrl}
-                target="_blank"
-                className="text-green-700 hover:underline text-sm font-medium"
-            >
-                PDF ↗
-            </a>
-            )}
-        </div>
-        </CardContent>
-    </Card>
-    ))}
-
+      </form>
     </div>
   );
-}
+};
 </file>
 
-<file path="src/app/api/pdf/chat/route.ts">
-import { google } from "@ai-sdk/google";
-import { streamText } from "ai";
-import { NextResponse } from "next/server";
-import { db } from "@/db";
-import { paperChunks } from "@/db/schema";
-import { generateEmbedding } from "@/lib/embed";
-import { desc, gt, sql, eq, and } from "drizzle-orm";
+<file path="src/modules/chat/ui/components/message-list.tsx">
+import ReactMarkdown from "react-markdown";
+import { Loader2 } from "lucide-react";
+import { ChatMessage } from "../../hooks/use-chat";
+import { cn } from "@/lib/utils";
 
-export async function POST(req: Request) {
-  try {
-    const body = await req.json();
-    
-    // Support both useChat format and direct format
-    const pdfId = body.pdfId || body.pdf_id;
-    const messages = body.messages || [];
-    const query = messages.length > 0 
-      ? messages[messages.length - 1].content 
-      : body.query;
+interface MessageListProps {
+  messages: ChatMessage[];
+  isLoading: boolean;
+  isEmpty: boolean;
+}
 
-    if (!pdfId || !query) {
-      return NextResponse.json(
-        { error: "Missing pdfId or query" },
-        { status: 400 }
-      );
-    }
-
-    // 1. Embed the user query using Jina
-    const queryVector = await generateEmbedding(query);
-
-    // 2. Similarity Search in Postgres
-    const similarity = sql<number>`1 - (${paperChunks.embedding} <=> ${JSON.stringify(queryVector)})`;
-
-    const relevantChunks = await db
-      .select({
-        content: paperChunks.content,
-        score: similarity,
-      })
-      .from(paperChunks)
-      .where(and(
-        eq(paperChunks.paperId, pdfId),
-        gt(similarity, 0.5)
-      ))
-      .orderBy(desc(similarity))
-      .limit(5);
-
-    const context = relevantChunks.map((c) => c.content).join("\n\n");
-
-    if (!context) {
-      return NextResponse.json(
-        { error: "No relevant context found in PDF. Please ensure the PDF has been processed." },
-        { status: 404 }
-      );
-    }
-
-    // 3. Stream Response using Gemini
-    const result = await streamText({
-      model: google("gemini-2.5-flash"), // Efficient and fast for RAG
-      system: `You are a helpful research assistant. Use the provided context from the PDF document to answer the user's question accurately and concisely. If the context doesn't contain enough information to answer the question, say so.
-      
-      CONTEXT FROM PDF:
-      ${context}`,
-      messages: messages.length > 0 
-        ? messages.map((m: any) => ({ role: m.role, content: m.content }))
-        : [{ role: "user" as const, content: query }],
-    });
-
-    return result.toTextStreamResponse();
-
-  } catch (error: any) {
-    console.error("[Chat API] Error:", error);
-    return NextResponse.json(
-      { error: error.message || "Internal Server Error" },
-      { status: 500 }
+export const MessageList = ({ messages, isLoading, isEmpty }: MessageListProps) => {
+  if (isEmpty) {
+    return (
+      <div className="flex items-center justify-center h-full text-center">
+        <div className="text-slate-500">
+          <p className="text-lg font-medium mb-2">Start a conversation</p>
+          <p className="text-sm">Ask questions about the PDF document</p>
+        </div>
+      </div>
     );
   }
-}
-</file>
-
-<file path="src/app/api/pdf/info/route.ts">
-import { NextResponse } from "next/server";
-import { db } from "@/db";
-import { papers } from "@/db/schema";
-import { eq } from "drizzle-orm";
-
-export async function GET(req: Request) {
-  try {
-    const { searchParams } = new URL(req.url);
-    const pdfId = searchParams.get("pdfId");
-
-    if (!pdfId) {
-      return NextResponse.json({ error: "Missing pdfId" }, { status: 400 });
-    }
-
-    const paper = await db
-      .select()
-      .from(papers)
-      .where(eq(papers.id, pdfId))
-      .limit(1);
-
-    if (paper.length === 0) {
-      return NextResponse.json({ error: "PDF not found" }, { status: 404 });
-    }
-
-    return NextResponse.json({
-      id: paper[0].id,
-      title: paper[0].title,
-      abstract: paper[0].abstract,
-      pdfUrl: paper[0].pdfUrl,
-      createdAt: paper[0].createdAt,
-    });
-  } catch (error: any) {
-    console.error("[Info API] Error:", error);
-    return NextResponse.json(
-      { error: error.message || "Internal Server Error" },
-      { status: 500 }
-    );
-  }
-}
-</file>
-
-<file path="src/app/api/pdf/load/route.ts">
-export const maxDuration = 60; // Allow up to 60s for processing PDFs
-
-import { NextResponse } from "next/server";
-import { db } from "@/db";
-import { papers, paperChunks } from "@/db/schema";
-import { eq } from "drizzle-orm";
-import { getPdfTextFromUrl, recursiveChunkText } from "@/lib/pdf-loader";
-import { generateEmbeddings } from "@/lib/embed";
-
-export async function POST(req: Request) {
-  try {
-    // 1. Parse Body
-    const { arxivId, title, pdfUrl } = await req.json();
-
-    if (!arxivId) {
-      return NextResponse.json({ error: "Missing arxivId" }, { status: 400 });
-    }
-
-    // 2. Sanitize the ID
-    // This handles cases where the frontend sends a full URL instead of just the ID
-    const cleanId = arxivId
-      .replace(/http:\/\/arxiv\.org\/abs\//g, "")
-      .replace(/https:\/\/arxiv\.org\/abs\//g, "")
-      .replace(".pdf", "")
-      .trim();
-
-    console.log(`[Load API] Processing request for ID: ${cleanId}`);
-
-    // 3. Check if already indexed (Deduping)
-    const existingPaper = await db
-      .select()
-      .from(papers)
-      .where(eq(papers.id, cleanId))
-      .limit(1);
-
-    if (existingPaper.length > 0) {
-      console.log(`[Load API] Paper ${cleanId} already exists.`);
-      return NextResponse.json({ 
-        message: "Already indexed", 
-        pdfId: cleanId,
-        success: true 
-      });
-    }
-
-    // 4. Construct Target URL
-    // If a specific PDF URL wasn't provided, guess it from the arXiv ID
-    const targetUrl = pdfUrl || `https://arxiv.org/pdf/${cleanId}.pdf`;
-    console.log(`[Load API] Fetching PDF from: ${targetUrl}`);
-
-    // 5. Extract Text (This can be slow)
-    const fullText = await getPdfTextFromUrl(targetUrl);
-    console.log(`[Load API] Extracted ${fullText.length} characters.`);
-
-    // 6. Save Paper Metadata FIRST
-    // We do this before chunks so we have the parent record
-    await db.insert(papers).values({
-      id: cleanId,
-      title: title || "Untitled Paper",
-      pdfUrl: targetUrl,
-      abstract: "", // Optional: You could scrape this too if needed
-    });
-
-    // 7. Chunk the Text
-    // 1000 chars ~ 200-250 tokens. Good size for retrieval.
-    const chunks = recursiveChunkText(fullText, 1000, 200);
-    console.log(`[Load API] Created ${chunks.length} text chunks.`);
-
-    // 8. Generate Embeddings & Save Batches
-    // Processing in batches prevents hitting API rate limits or timeouts
-    const BATCH_SIZE = 10; 
-    
-    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-      const batchChunks = chunks.slice(i, i + BATCH_SIZE);
-      
-      // Generate embeddings for this batch (calls Jina AI)
-      const embeddings = await generateEmbeddings(batchChunks);
-
-      // Prepare database rows
-      const valuesToInsert = batchChunks.map((chunkText, idx) => ({
-        paperId: cleanId,
-        content: chunkText,
-        embedding: embeddings[idx],
-      }));
-
-      // Insert batch
-      await db.insert(paperChunks).values(valuesToInsert);
-      console.log(`[Load API] Saved batch ${Math.ceil((i + 1) / BATCH_SIZE)}`);
-    }
-
-    console.log(`[Load API] Successfully indexed ${cleanId}`);
-    return NextResponse.json({ 
-      success: true, 
-      pdfId: cleanId,
-      chunks: chunks.length 
-    });
-
-  } catch (error: any) {
-    console.error("[Load API] Error:", error);
-    return NextResponse.json(
-      { error: error.message || "Internal Server Error" }, 
-      { status: 500 }
-    );
-  }
-}
-</file>
-
-<file path="src/app/api/pdf/serve/route.ts">
-// src/app/api/pdf/serve/route.ts
-export const runtime = "nodejs";
-
-import { NextResponse } from "next/server";
-import { redis, ensureRedis } from "@/lib/redis";
-import { db } from "@/db";
-import { papers } from "@/db/schema";
-import { eq } from "drizzle-orm";
-
-export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const pdfId = searchParams.get("pdfId");
-
-  if (!pdfId) {
-    return NextResponse.json({ error: "Missing pdfId" }, { status: 400 });
-  }
-
-  let base64: string | null = null;
-
-  // Try Redis first
-  try {
-    await ensureRedis();
-    base64 = await redis.get(`pdf:${pdfId}`);
-  } catch (error) {
-    console.warn("[Serve API] Redis not available, checking database");
-  }
-
-  // Fallback to database if Redis doesn't have it
-  if (!base64) {
-    const paper = await db
-      .select({ pdfData: papers.pdfData })
-      .from(papers)
-      .where(eq(papers.id, pdfId))
-      .limit(1);
-
-    if (paper.length > 0 && paper[0].pdfData) {
-      base64 = paper[0].pdfData;
-    }
-  }
-
-  if (!base64) {
-    return NextResponse.json({ error: "PDF not found" }, { status: 404 });
-  }
-
-  // Convert back to binary buffer
-  const buffer = Buffer.from(base64, "base64");
-
-  return new NextResponse(buffer, {
-    headers: {
-      "Content-Type": "application/pdf",
-      "Content-Length": buffer.length.toString(),
-      "Cache-Control": "public, max-age=31536000, immutable",
-    },
-  });
-}
-</file>
-
-<file path="src/app/api/pdf/upload/route.ts">
-export const maxDuration = 60; // Allow up to 60s for processing PDFs
-export const runtime = "nodejs"; // Ensure Node.js runtime for PDF parsing
-
-import { NextResponse } from "next/server";
-import { db } from "@/db";
-import { papers, paperChunks } from "@/db/schema";
-import { eq } from "drizzle-orm";
-import { extractPdfText } from "@/lib/extract-pdf";
-import { recursiveChunkText } from "@/lib/pdf-loader";
-import { generateEmbeddings } from "@/lib/embed";
-import { randomUUID } from "crypto";
-import { redis, ensureRedis } from "@/lib/redis";
-
-export async function POST(req: Request) {
-  try {
-    const formData = await req.formData();
-    const file = formData.get("file") as File;
-
-    if (!file) {
-      return NextResponse.json({ error: "No file provided" }, { status: 400 });
-    }
-
-    if (file.type !== "application/pdf") {
-      return NextResponse.json({ error: "File must be a PDF" }, { status: 400 });
-    }
-
-    // Check file size (10MB limit)
-    const maxSize = 10 * 1024 * 1024; // 10MB
-    if (file.size > maxSize) {
-      return NextResponse.json(
-        { error: "File size must be less than 10MB" },
-        { status: 400 }
-      );
-    }
-
-    // Generate unique ID for this PDF
-    const pdfId = randomUUID();
-    const fileName = file.name.replace(/\.pdf$/i, "");
-
-    // Convert file to buffer
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    // Store PDF - try Redis first, fallback to database
-    const base64 = buffer.toString("base64");
-    let storedInRedis = false;
-    
-    try {
-      await ensureRedis();
-      await redis.set(`pdf:${pdfId}`, base64);
-      storedInRedis = true;
-    } catch (error) {
-      console.warn("[Upload API] Redis not available, storing PDF in database");
-    }
-
-    // Extract text from PDF
-    console.log(`[Upload API] Extracting text from PDF: ${fileName}`);
-    const fullText = await extractPdfText(buffer);
-    console.log(`[Upload API] Extracted ${fullText.length} characters.`);
-
-    if (fullText.length === 0) {
-      return NextResponse.json(
-        { error: "Could not extract text from PDF" },
-        { status: 400 }
-      );
-    }
-
-    // Check if a paper with the same content already exists (optional deduplication)
-    // For now, we'll always create a new entry since it's user-uploaded
-
-    // Save Paper Metadata (include PDF data if Redis is not available)
-    await db.insert(papers).values({
-      id: pdfId,
-      title: fileName || "Untitled Document",
-      pdfUrl: `/api/pdf/serve?pdfId=${pdfId}`, // Internal URL for serving
-      abstract: fullText.substring(0, 500), // First 500 chars as abstract
-      pdfData: storedInRedis ? null : base64, // Store in DB only if Redis unavailable
-    });
-
-    // Chunk the Text
-    const chunks = recursiveChunkText(fullText, 1000, 200);
-    console.log(`[Upload API] Created ${chunks.length} text chunks.`);
-
-    // Generate Embeddings & Save Batches
-    const BATCH_SIZE = 10;
-
-    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-      const batchChunks = chunks.slice(i, i + BATCH_SIZE);
-
-      // Generate embeddings for this batch
-      const embeddings = await generateEmbeddings(batchChunks);
-
-      // Prepare database rows
-      const valuesToInsert = batchChunks.map((chunkText, idx) => ({
-        paperId: pdfId,
-        content: chunkText,
-        embedding: embeddings[idx],
-      }));
-
-      // Insert batch
-      await db.insert(paperChunks).values(valuesToInsert);
-      console.log(`[Upload API] Saved batch ${Math.ceil((i + 1) / BATCH_SIZE)}/${Math.ceil(chunks.length / BATCH_SIZE)}`);
-    }
-
-    console.log(`[Upload API] Successfully processed PDF: ${pdfId}`);
-    return NextResponse.json({
-      success: true,
-      pdfId: pdfId,
-      chunks: chunks.length,
-      title: fileName,
-    });
-
-  } catch (error: any) {
-    console.error("[Upload API] Error:", error);
-    return NextResponse.json(
-      { error: error.message || "Internal Server Error" },
-      { status: 500 }
-    );
-  }
-}
-</file>
-
-<file path="src/app/api/search/arxiv/route.ts">
-import { NextResponse } from "next/server";
-import xml2js from "xml2js";
-
-export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const q = searchParams.get("q") || "";
-
-  if (!q) {
-    return NextResponse.json({ results: [] });
-  }
-
-  const url = `http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(
-    q
-  )}&start=0&max_results=5`;
-
-  const xml = await fetch(url).then((r) => r.text());
-  const parsed = await xml2js.parseStringPromise(xml, { explicitArray: false });
-  const entries = parsed.feed.entry || [];
-  const normalized = Array.isArray(entries) ? entries : [entries];
-
-  const results = normalized.map((e: any) => ({
-    // FIX: Strip the URL prefix to get just the ID
-    id: e.id.replace(/http:\/\/arxiv\.org\/abs\//g, "").replace(/https:\/\/arxiv\.org\/abs\//g, ""),
-    title: e.title?.trim(),
-    summary: e.summary?.trim(),
-    authors:
-      e.author && Array.isArray(e.author)
-        ? e.author.map((a: any) => a.name).join(", ")
-        : e.author?.name || "Unknown",
-    pdfUrl:
-      e.link?.find?.((l: any) => l.$.type === "application/pdf")?.$.href ?? null,
-  }));
-
-  return NextResponse.json({ results });
-}
-</file>
-
-<file path="src/components/pdf-upload.tsx">
-"use client";
-
-import { Upload, FileText, X } from 'lucide-react';
-import { useState } from 'react';
-
-interface PDFUploadProps {
-  onPDFSelect: (file: File) => void;
-  loading?: boolean;
-}
-
-export default function PDFUpload({ onPDFSelect, loading = false }: PDFUploadProps) {
-  const [dragActive, setDragActive] = useState(false);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-
-  const handleDrag = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.type === 'dragenter' || e.type === 'dragover') {
-      setDragActive(true);
-    } else if (e.type === 'dragleave') {
-      setDragActive(false);
-    }
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragActive(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      const file = e.dataTransfer.files[0];
-      if (file.type === 'application/pdf') {
-        setSelectedFile(file);
-        onPDFSelect(file);
-      }
-    }
-  };
-
-  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const file = e.target.files[0];
-      if (file.type === 'application/pdf') {
-        setSelectedFile(file);
-        onPDFSelect(file);
-      }
-    }
-  };
-
-  const handleRemove = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setSelectedFile(null);
-  };
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-white">
-      <div className="w-full max-w-2xl px-8">
-        <div className="text-center mb-8">
-          <h1 className="text-4xl font-bold text-slate-900 mb-3">
-            Chat with PDF
-          </h1>
-          <p className="text-lg text-slate-600">
-            Upload a PDF document to start chatting with it
-          </p>
-        </div>
-
-        {selectedFile ? (
-          <div className="border-2 border-emerald-500 rounded-2xl p-8 bg-emerald-50">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-4">
-                <div className="w-12 h-12 bg-emerald-100 rounded-lg flex items-center justify-center">
-                  <FileText className="w-6 h-6 text-emerald-600" />
-                </div>
-                <div>
-                  <p className="font-semibold text-slate-900">{selectedFile.name}</p>
-                  <p className="text-sm text-slate-600">
-                    {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
-                  </p>
-                </div>
-              </div>
-              {!loading && (
-                <button
-                  onClick={handleRemove}
-                  className="p-2 hover:bg-emerald-200 rounded-lg transition-colors"
-                >
-                  <X className="w-5 h-5 text-slate-600" />
-                </button>
-              )}
-            </div>
-            {loading && (
-              <div className="mt-4">
-                <div className="w-full bg-emerald-200 rounded-full h-2">
-                  <div className="bg-emerald-600 h-2 rounded-full animate-pulse" style={{ width: '60%' }}></div>
-                </div>
-                <p className="text-sm text-emerald-700 mt-2 text-center">
-                  Processing PDF...
-                </p>
-              </div>
-            )}
+    <div className="space-y-4">
+      {messages.map((m, idx) => (
+        <div key={idx} className={cn("flex", m.role === "user" ? "justify-end" : "justify-start")}>
+          <div className={cn(
+            "max-w-[85%] rounded-2xl px-4 py-3 text-sm shadow-sm",
+            m.role === "user" 
+              ? "bg-emerald-600 text-white rounded-br-none" 
+              : "bg-white text-slate-900 border border-slate-100 rounded-bl-none"
+          )}>
+            <ReactMarkdown components={{
+                strong: ({node, ...props}) => <span className="font-semibold text-emerald-800" {...props} />,
+                p: ({node, ...props}) => <p className="mb-2 last:mb-0" {...props} />,
+                ul: ({node, ...props}) => <ul className="list-disc pl-4 mb-2 space-y-1" {...props} />,
+                li: ({node, ...props}) => <li className="pl-1" {...props} />
+            }}>
+              {m.content}
+            </ReactMarkdown>
           </div>
-        ) : (
-          <div
-            className={`relative border-2 border-dashed rounded-2xl p-12 transition-all ${
-              dragActive
-                ? 'border-emerald-500 bg-emerald-50'
-                : 'border-slate-300 hover:border-slate-400 bg-white'
-            }`}
-            onDragEnter={handleDrag}
-            onDragLeave={handleDrag}
-            onDragOver={handleDrag}
-            onDrop={handleDrop}
+        </div>
+      ))}
+
+      {isLoading && (
+        <div className="flex justify-start">
+          <div className="bg-white text-slate-900 border border-slate-100 rounded-2xl rounded-bl-none px-4 py-3 shadow-sm">
+            <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+</file>
+
+<file path="src/modules/chat/ui/components/pdf-viewer.tsx">
+"use client";
+
+import { Loader2 } from "lucide-react";
+
+interface PDFViewerProps {
+  url: string | null;
+  loading: boolean;
+}
+
+export const PDFViewer = ({ url, loading }: PDFViewerProps) => {
+  return (
+    <div className="  overflow-hidden flex flex-col h-full bg-slate-100">
+      <div className="flex-1 min-h-0 overflow-hidden relative">
+        {loading ? (
+          <div className="flex items-center justify-center h-full">
+            <Loader2 className="w-8 h-8 animate-spin text-emerald-600" />
+          </div>
+        ) : url ? (
+          // The <object> tag uses the browser's native PDF viewer
+          // ensuring 100% fidelity and zero JS crashes.
+          <object
+            data={url}
+            type="application/pdf"
+            className="w-full h-full block"
           >
-            <input
-              type="file"
-              accept="application/pdf"
-              onChange={handleFileInput}
-              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-              disabled={loading}
-            />
-            <div className="flex flex-col items-center text-center">
-              <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center mb-4">
-                <Upload className="w-8 h-8 text-emerald-600" />
-              </div>
-              <h3 className="text-xl font-semibold text-slate-900 mb-2">
-                Drop your PDF here
-              </h3>
-              <p className="text-slate-600 mb-4">
-                or click to browse from your computer
-              </p>
-              <p className="text-sm text-slate-500">
-                Supports PDF files up to 10MB
-              </p>
+            {/* Fallback for browsers that don't support PDF embedding */}
+            <div className="flex flex-col items-center justify-center h-full text-slate-500 gap-2">
+              <p>Unable to display PDF directly.</p>
+              <a 
+                href={url} 
+                target="_blank" 
+                rel="noopener noreferrer"
+                className="text-emerald-600 hover:underline font-medium"
+              >
+                Download to view
+              </a>
             </div>
+          </object>
+        ) : (
+          <div className="flex items-center justify-center h-full text-slate-400 text-sm">
+            Select a document to view
           </div>
         )}
-
-        <div className="mt-8 text-center text-sm text-slate-500">
-          Your documents are processed securely and never shared
-        </div>
       </div>
     </div>
   );
-}
+};
 </file>
 
-<file path="src/lib/arxiv.ts">
-// src/lib/arxiv.ts
-// Server-side arXiv search. No external libs. Raw HTTP + XML parsing.
+<file path="src/modules/chat/ui/components/research-summary.tsx">
+import { useState } from "react";
+import ReactMarkdown from "react-markdown";
+import { BookOpen, ChevronDown, ChevronUp } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 
-export async function searchArxiv(query: string, maxResults = 5): Promise<Paper[]> {
-  if (!query.trim()) return [];
-
-  const encodedQuery = encodeURIComponent(query);
-  const url = `http://export.arxiv.org/api/query?search_query=all:${encodedQuery}&start=0&max_results=${maxResults}&sortBy=relevance&sortOrder=descending`;
-
-  try {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`arXiv API error: ${response.status}`);
-
-    const xml = await response.text();
-
-    // Simple XML → JSON parser (no deps, handles arXiv's Atom format)
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(xml, "text/xml");
-    const entries = doc.querySelectorAll("entry");
-
-    const papers: Paper[] = [];
-    entries.forEach((entry) => {
-      const id = entry.querySelector("id")?.textContent?.replace("http://arxiv.org/abs/", "") || "";
-      const title = entry.querySelector("title")?.textContent?.trim() || "Untitled";
-      const summary = entry.querySelector("summary")?.textContent?.trim() || "";
-      
-      const authors = Array.from(entry.querySelectorAll("author name")).map((author) => author.textContent?.trim() || "Unknown");
-      
-      const published = entry.querySelector("published")?.textContent || new Date().toISOString();
-      
-      const pdfLink = Array.from(entry.querySelectorAll("link"))
-        .find((link) => link.getAttribute("title") === "pdf")?.getAttribute("href") || 
-        `https://arxiv.org/pdf/${id}.pdf`;
-      
-      const category = entry.querySelector("arxiv:primary_category")?.getAttribute("term") || "unknown";
-
-      papers.push({
-        id,
-        title,
-        authors,
-        published,
-        abstract: summary,
-        pdfUrl: pdfLink,
-        category,
-      });
-    });
-
-    return papers;
-  } catch (error) {
-    console.error("arXiv search failed:", error);
-    return [];
-  }
+interface ResearchSummaryProps {
+  summary: string;
 }
 
-export interface Paper {
-  id: string;
-  title: string;
-  authors: string[];
-  published: string;
-  abstract: string;
-  pdfUrl: string;
-  category: string;
-}
+export const ResearchSummary = ({ summary }: ResearchSummaryProps) => {
+  const [isOpen, setIsOpen] = useState(false);
+
+  if (!summary) return null;
+
+  return (
+    <Collapsible open={isOpen} onOpenChange={setIsOpen} className="w-full mb-4">
+      <Card className="border-emerald-100 bg-emerald-50/50 shadow-sm">
+        <CardHeader 
+          className="py-3 px-4 flex flex-row items-center justify-between space-y-0 cursor-pointer" 
+          onClick={() => setIsOpen(!isOpen)}
+        >
+          <div className="flex items-center gap-2">
+            <BookOpen className="w-4 h-4 text-emerald-700" />
+            <CardTitle className="text-sm font-semibold text-emerald-900">
+              Research Overview
+            </CardTitle>
+          </div>
+          <CollapsibleTrigger asChild>
+            <Button variant="ghost" size="sm" className="h-6 w-6 p-0 hover:bg-emerald-100">
+              {isOpen ? <ChevronUp className="h-4 w-4 text-emerald-700" /> : <ChevronDown className="h-4 w-4 text-emerald-700" />}
+            </Button>
+          </CollapsibleTrigger>
+        </CardHeader>
+        <CollapsibleContent>
+          <CardContent className="px-4 pb-4 pt-0 text-sm text-slate-700 leading-relaxed">
+            <ReactMarkdown 
+              components={{
+                strong: ({ node, ...props }) => <span className="font-semibold text-emerald-800" {...props} />,
+                p: ({ node, ...props }) => <p className="mb-2 last:mb-0" {...props} />,
+                ul: ({ node, ...props }) => <ul className="list-disc pl-4 mb-2 space-y-1" {...props} />,
+                li: ({ node, ...props }) => <li className="pl-1" {...props} />
+              }}
+            >
+              {summary}
+            </ReactMarkdown>
+          </CardContent>
+        </CollapsibleContent>
+      </Card>
+    </Collapsible>
+  );
+};
 </file>
 
-<file path="src/lib/chunk.ts">
-export function chunk(text: string, size = 1200) {
-    const words = text.split(" ");
-    const chunks = [];
-    for (let i = 0; i < words.length; i += size) {
-      chunks.push(words.slice(i, i + size).join(" "));
-    }
-    return chunks;
-  }
+<file path="src/modules/chat/ui/views/chat-view.tsx">
+"use client";
+
+import { useParams } from "next/navigation";
+import { useChat } from "@/modules/chat/hooks/use-chat";
+import { PDFViewer } from "../components/pdf-viewer";
+import { ResearchSummary } from "../components/research-summary";
+import { MessageList } from "../components/message-list";
+import { ChatInput } from "../components/chat-input";
+// Import the resizable components
+import { 
+  ResizableHandle, 
+  ResizablePanel, 
+  ResizablePanelGroup 
+} from "@/components/ui/resizable";
+
+export const ChatView = () => {
+  const { id } = useParams();
   
-  export function chunkText(text: string, size = 1200): string[] {
-    const words = text.split(/\s+/);
-    const result: string[] = [];
-  
-    for (let i = 0; i < words.length; i += size) {
-      result.push(words.slice(i, i + size).join(" "));
-    }
-  
-    return result;
-  }
+  const {
+    pdfId,
+    pdfUrl,
+    pdfTitle,
+    pdfSummary,
+    loading,
+    messages,
+    input,
+    setInput,
+    isStreaming,
+    handleSubmit,
+    messagesEndRef
+  } = useChat(id);
+
+  return (
+    <div className="h-screen w-full bg-white overflow-hidden">
+      <ResizablePanelGroup direction="horizontal" className="h-full w-full">
+        
+        {/* LEFT PANEL: PDF */}
+        <ResizablePanel defaultSize={50} minSize={20}>
+          <PDFViewer url={pdfUrl} loading={loading} />
+        </ResizablePanel>
+
+        {/* DRAGGABLE HANDLE */}
+        <ResizableHandle withHandle />
+
+        {/* RIGHT PANEL: CHAT */}
+        <ResizablePanel defaultSize={50} minSize={30}>
+          <div className="flex flex-col h-full bg-slate-50 min-h-0">
+            {/* Header */}
+            {/* <div className="border-b border-slate-200 px-4 py-3 bg-white shrink-0 shadow-sm">
+              <h2 className="font-semibold text-slate-900 truncate">
+                {loading ? "Loading..." : pdfTitle}
+              </h2>
+            </div> */}
+
+            {/* Messages Area */}
+            <div className="flex-1 overflow-y-auto p-4 min-h-0 scroll-smooth">
+              {!loading && <ResearchSummary summary={pdfSummary} />}
+              
+              <MessageList 
+                messages={messages} 
+                isLoading={isStreaming} 
+                isEmpty={messages.length === 0 && !loading && !pdfSummary} 
+              />
+              
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Input */}
+            <ChatInput 
+              input={input}
+              setInput={setInput}
+              onSubmit={handleSubmit}
+              loading={isStreaming}
+              disabled={!pdfId}
+            />
+          </div>
+        </ResizablePanel>
+
+      </ResizablePanelGroup>
+    </div>
+  );
+};
 </file>
 
-<file path="src/lib/embed.ts">
-const JINA_API_KEY = process.env.JINA_API_KEY;
+<file path="src/modules/dashboard/context/header-context.tsx">
+"use client";
 
-export async function generateEmbedding(text: string): Promise<number[]> {
-  const embeddings = await generateEmbeddings([text]);
-  return embeddings[0];
-}
+import React, { createContext, useContext, useState, useEffect } from "react";
 
-export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
-  if (!JINA_API_KEY) throw new Error("JINA_API_KEY is not set");
-
-  const response = await fetch("https://api.jina.ai/v1/embeddings", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${JINA_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "jina-embeddings-v3", // SOTA model
-      // 'retrieval.passage' optimizes vectors for storage/indexing
-      task: "retrieval.passage", 
-      dimensions: 1024,
-      late_chunking: false,
-      input: texts,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Jina API Error: ${response.statusText}`);
-  }
-
-  const data = await response.json();
-  return data.data.map((d: any) => d.embedding);
-}
-</file>
-
-<file path="src/lib/extract-pdf.ts">
-// Use unpdf - platform-agnostic PDF.js for serverless environments
-// Inspired by: https://github.com/RihanArfan/chat-with-pdf
-import { getDocumentProxy, extractText } from 'unpdf'
-
-export async function extractPdfText(buffer: Buffer): Promise<string> {
-  try {
-    // Convert Buffer to Uint8Array for unpdf
-    const uint8Array = new Uint8Array(buffer);
-    
-    // Get document proxy
-    const pdf = await getDocumentProxy(uint8Array);
-    
-    // Extract text with mergePages option to combine all pages
-    const result = await extractText(pdf, { mergePages: true });
-    
-    // Handle both array and string results
-    return Array.isArray(result.text) ? result.text.join(' ') : result.text || "";
-  } catch (error: any) {
-    console.error("Error extracting PDF text:", error);
-    throw new Error(`Failed to extract text from PDF: ${error.message}`);
-  }
-}
-</file>
-
-<file path="src/lib/memory-store.ts">
-export const memoryStore: Record<
-  string,
-  { chunks: string[]; embeddings: number[][]; filePath: string }
-> = {};
-</file>
-
-<file path="src/lib/pdf-loader.ts">
-// Use unpdf - platform-agnostic PDF.js for serverless environments
-import { getDocumentProxy, extractText } from 'unpdf'
- 
-export async function getPdfTextFromUrl(url: string): Promise<string> {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Failed to fetch PDF: ${response.statusText}`);
-  
-  const arrayBuffer = await response.arrayBuffer();
-  const uint8Array = new Uint8Array(arrayBuffer);
-  
-  // Get document proxy
-  const pdf = await getDocumentProxy(uint8Array);
-  
-  // Extract text with mergePages option to combine all pages
-  const result = await extractText(pdf, { mergePages: true });
-  
-  // Handle both array and string results
-  return Array.isArray(result.text) ? result.text.join(' ') : result.text || "";
-}
-
-export function recursiveChunkText(text: string, chunkSize = 1000, overlap = 200): string[] {
-  const chunks: string[] = [];
-  let startIndex = 0;
-
-  while (startIndex < text.length) {
-    let endIndex = startIndex + chunkSize;
-    
-    // Try to find a sentence break to avoid cutting words/sentences awkwardly
-    if (endIndex < text.length) {
-      const nextSpace = text.indexOf(' ', endIndex);
-      if (nextSpace !== -1 && nextSpace - endIndex < 100) {
-        endIndex = nextSpace;
-      }
-    }
-
-    const chunk = text.slice(startIndex, endIndex).replace(/\s+/g, " ").trim();
-    if (chunk.length > 0) {
-      chunks.push(chunk);
-    }
-
-    startIndex += (chunkSize - overlap);
-  }
-
-  return chunks;
-}
-</file>
-
-<file path="src/lib/redis.ts">
-// src/lib/redis.ts
-import { createClient } from "redis";
-
-const redisUrl = process.env.REDIS_URL;
-
-let redisClient: ReturnType<typeof createClient> | null = null;
-let started = false;
-
-// Create Redis client if URL is provided
-if (redisUrl) {
-  redisClient = createClient({ url: redisUrl });
-  
-  redisClient.on("error", (err) => {
-    console.error("Redis Client Error:", err);
-  });
-}
-
-export const redis = {
-  async get(key: string): Promise<string | null> {
-    if (!redisClient) {
-      console.warn("Redis not configured. PDF serving will not work. Set REDIS_URL environment variable.");
-      return null;
-    }
-    if (!started) {
-      await ensureRedis();
-    }
-    try {
-      return await redisClient.get(key);
-    } catch (error) {
-      console.error("Redis get error:", error);
-      return null;
-    }
-  },
-  async set(key: string, value: string): Promise<void> {
-    if (!redisClient) {
-      console.warn("Redis not configured. PDF storage will not work. Set REDIS_URL environment variable.");
-      return;
-    }
-    if (!started) {
-      await ensureRedis();
-    }
-    try {
-      await redisClient.set(key, value);
-    } catch (error) {
-      console.error("Redis set error:", error);
-    }
-  },
+type HeaderContextType = {
+  title: string | null;
+  setTitle: (title: string | null) => void;
 };
 
-export async function ensureRedis() {
-  if (!redisClient) {
-    console.warn("Redis not configured. Set REDIS_URL environment variable to enable PDF storage.");
-    return;
+const HeaderContext = createContext<HeaderContextType | undefined>(undefined);
+
+export function HeaderProvider({ children }: { children: React.ReactNode }) {
+  const [title, setTitle] = useState<string | null>(null);
+
+  return (
+    <HeaderContext.Provider value={{ title, setTitle }}>
+      {children}
+    </HeaderContext.Provider>
+  );
+}
+
+export function useHeader() {
+  const context = useContext(HeaderContext);
+  if (!context) {
+    throw new Error("useHeader must be used within a HeaderProvider");
   }
-  if (!started) {
-    try {
-      await redisClient.connect();
-      started = true;
-      console.log("Redis connected successfully");
-    } catch (error) {
-      console.error("Failed to connect to Redis:", error);
-      throw error;
-    }
-  }
+  return context;
 }
 </file>
 
-<file path="src/modules/search/ui/components/paper-card.tsx">
-// src/modules/research/ui/paper-card.tsx
-import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
-import { MessageSquare } from "lucide-react"
-import Link from "next/link"
+<file path="src/modules/search/ui/components/curated-topics.tsx">
+"use client";
 
-interface Paper {
-  id: string
-  title: string
-  authors: string[]
-  published: string
-  abstract: string
-  pdfUrl: string
-  category: string
-}
+import { useState } from "react";
+import { CURATED_PAPERS, CURATED_TOPICS, CuratedCategory } from "@/lib/curated-papers";
+import { Button } from "@/components/ui/button";
+import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
+import { cn } from "@/lib/utils";
+import { PaperCard } from "./paper-card"; // Import the shared card
 
-export function PaperCard({ paper }: { paper: Paper }) {
+export function CuratedTopics() {
+  const [selectedTopic, setSelectedTopic] = useState<CuratedCategory>("Transformers");
+
   return (
-    <div className="border rounded-lg p-6 hover:shadow-lg transition-shadow bg-card">
-      <div className="flex justify-between items-start mb-4">
-        <div className="flex-1">
-          <h3 className="text-xl font-semibold mb-2 line-clamp-2">
-            <a href={`https://arxiv.org/abs/${paper.id}`} target="_blank" className="hover:underline">
-              {paper.title}
-            </a>
-          </h3>
-          <p className="text-sm text-muted-foreground mb-3">
-            {paper.authors.slice(0, 3).join(", ")}
-            {paper.authors.length > 3 && " et al."} • {new Date(paper.published).toLocaleDateString()}
-          </p>
-          <Badge variant="secondary">{paper.category}</Badge>
+    <div className="w-full max-w-4xl space-y-6">
+      <div className="flex flex-col gap-1">
+        <h2 className="text-2xl font-bold text-slate-900">Hall of Fame</h2>
+        <p className="text-muted-foreground text-sm">
+            Essential reading for AI researchers, curated by impact.
+        </p>
+      </div>
+
+      {/* TOPIC TABS */}
+      <ScrollArea className="w-full whitespace-nowrap pb-2">
+        <div className="flex w-max space-x-2">
+          {CURATED_TOPICS.map((topic) => (
+            <Button
+              key={topic}
+              variant={selectedTopic === topic ? "default" : "outline"}
+              onClick={() => setSelectedTopic(topic)}
+              className={cn(
+                "rounded-full px-6 transition-all border-slate-200",
+                selectedTopic === topic 
+                  ? "bg-slate-900 text-white hover:bg-slate-800 border-transparent shadow-md" 
+                  : "bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900 hover:border-slate-300"
+              )}
+            >
+              {topic}
+            </Button>
+          ))}
         </div>
+        <ScrollBar orientation="horizontal" className="invisible" />
+      </ScrollArea>
 
-        <Button asChild size="sm">
-          <Link href={`/chat/${paper.id}`}>
-            <MessageSquare className="mr-2 h-4 w-4" />
-            Chat with PDF
-          </Link>
-        </Button>
-      </div>
-
-      <p className="text-muted-foreground text-sm leading-relaxed line-clamp-4">
-        {paper.abstract}
-      </p>
-    </div>
-  )
-}
-</file>
-
-<file path="src/modules/search/ui/views/search-view.tsx">
-// src/modules/research/ui/search-page.tsx
-"use client"
-
-import { useState } from "react"
-import { Input } from "@/components/ui/input"
-import { Button } from "@/components/ui/button"
-import { SearchIcon } from "lucide-react"
-import { searchArxiv } from "@/lib/arxiv"
-import { PaperCard } from "../components/paper-card"
-
-export function SearchPage() {
-  const [query, setQuery] = useState("")
-  const [results, setResults] = useState<any[]>([])
-  const [loading, setLoading] = useState(false)
-
-  // Replace the handleSearch function
-const handleSearch = async () => {
-    if (!query.trim()) return;
-    setLoading(true);
-    try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-      const { results } = await res.json();
-      setResults(results);
-    } catch (error) {
-      console.error("Search failed:", error);
-      setResults([]);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div className="container max-w-5xl py-8">
-      <div className="mb-10 text-center">
-        <h1 className="text-4xl font-bold mb-4">Search arXiv Papers</h1>
-        <p className="text-muted-foreground">Find any AI paper instantly and chat with it</p>
-      </div>
-
-      <div className="flex gap-3 max-w-2xl mx-auto mb-12">
-        <Input
-          placeholder="e.g. attention is all you need, grok-1 technical report, llama 3"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-          className="text-lg h-12"
-        />
-        <Button onClick={handleSearch} size="lg" disabled={loading}>
-          <SearchIcon className="mr-2" />
-          Search
-        </Button>
-      </div>
-
-      <div className="grid gap-6">
-        {loading && <div className="text-center">Searching arXiv...</div>}
-        {results.map((paper) => (
+      {/* PAPER LIST - Now using PaperCard */}
+      <div className="grid grid-cols-1 gap-4 animate-in fade-in slide-in-from-bottom-2 duration-500">
+        {CURATED_PAPERS[selectedTopic].map((paper) => (
           <PaperCard key={paper.id} paper={paper} />
         ))}
-        {!loading && results.length === 0 && query && (
-          <p className="text-center text-muted-foreground">No results found. Try different keywords.</p>
-        )}
       </div>
     </div>
-  )
+  );
 }
 </file>
 
@@ -1690,8 +1168,111 @@ const Layout = ({children}: Props) => {
 export default Layout;
 </file>
 
+<file path="src/app/(dashboard)/chat/[id]/page.tsx">
+import { ChatView } from "@/modules/chat/ui/views/chat-view";
+
+export default function ChatWithPaperPage() {
+  return <ChatView />;
+}
+</file>
+
+<file path="src/app/(dashboard)/chat/page.tsx">
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import PDFUpload from "@/components/pdf-upload";
+
+export default function ChatLandingPage() {
+  const router = useRouter();
+  const [loading, setLoading] = useState(false);
+
+  async function handlePDFSelect(file: File) {
+    setLoading(true);
+
+    try {
+      const form = new FormData();
+      form.append("file", file);
+
+      const res = await fetch("/api/pdf/upload", {
+        method: "POST",
+        body: form,
+      });
+
+      // Check if response is JSON
+      const contentType = res.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        const text = await res.text();
+        throw new Error(`Server error: ${res.status} ${res.statusText}`);
+      }
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to upload PDF");
+      }
+
+      if (data.pdfId) {
+        router.push(`/chat/${data.pdfId}`);
+      } else {
+        throw new Error("No PDF ID returned from server");
+      }
+    } catch (error: any) {
+      console.error("Upload error:", error);
+      alert(error.message || "Failed to upload PDF. Please try again.");
+      setLoading(false);
+    }
+  }
+
+  return <PDFUpload onPDFSelect={handlePDFSelect} loading={loading} />;
+}
+</file>
+
+<file path="src/app/(dashboard)/research/page.tsx">
+// // src/app/(dashboard)/research/page.tsx
+// export const revalidate = 900 // 15 min
+// export default function ResearchPage() {
+//   return <ResearchFeed />
+// }
+</file>
+
+<file path="src/app/(dashboard)/search/page.tsx">
+"use client"
+
+import { useState } from "react"
+import { Input } from "@/components/ui/input"
+import { Button } from "@/components/ui/button"
+import { SearchIcon, Filter, ArrowUpDown } from "lucide-react"
+import { PaperCard } from "@/modules/search/ui/components/paper-card"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+// IMPORT THE NEW MODULE
+import { CuratedTopics } from "@/modules/search/ui/components/curated-topics"
+import SearchView from "@/modules/search/ui/views/search-view"
+
+const CATEGORIES = [
+    { value: "all", label: "All Categories" },
+    { value: "cs.AI", label: "Artificial Intelligence (cs.AI)" },
+    { value: "cs.LG", label: "Machine Learning (cs.LG)" },
+    { value: "cs.CL", label: "Computation & Language (NLP)" },
+    { value: "cs.CV", label: "Computer Vision (cs.CV)" },
+    { value: "cs.RO", label: "Robotics (cs.RO)" },
+    { value: "cs.MA", label: "Multiagent Systems (cs.MA)" },
+]
+
+const SORT_OPTIONS = [
+    { value: "relevance", label: "Relevance" },
+    { value: "submittedDate", label: "Submission Date" },
+    { value: "lastUpdatedDate", label: "Last Updated" },
+]
+
+export default function SearchPage(){
+  return <SearchView />;
+}
+</file>
+
 <file path="src/app/(dashboard)/layout.tsx">
 import { SidebarProvider } from "@/components/ui/sidebar"
+import { HeaderProvider } from "@/modules/dashboard/context/header-context"
 import { DashboardNavbar } from "@/modules/dashboard/ui/components/dashboard-navbar"
 import { DashboardSidebar } from "@/modules/dashboard/ui/components/dashboard-sidebar"
 
@@ -1702,11 +1283,13 @@ interface Props {
 const Layout = ({ children }: Props) => {
     return (
         <SidebarProvider>
-            <DashboardSidebar />
-            <main className="flex flex-col h-screen w-screen bg-muted">
-                <DashboardNavbar />
-                {children}
-            </main>
+            <HeaderProvider>
+                <DashboardSidebar />
+                <main className="flex flex-col h-screen w-screen bg-muted">
+                    <DashboardNavbar />
+                    {children}
+                </main>
+            </HeaderProvider>
         </SidebarProvider>
     )
 }
@@ -1714,34 +1297,627 @@ const Layout = ({ children }: Props) => {
 export default Layout
 </file>
 
-<file path="src/app/(dashboard)/page.tsx">
-import { auth } from "@/lib/auth"
-import { headers } from "next/headers"
-import { redirect } from "next/navigation"
-
-const Page = async () => {
-  const session = await auth.api.getSession({
-    headers: await headers(),
-  })
-
-  if (!session) {
-    redirect("/sign-in")
-  }
-
-  // Redirect to convert page as the default
-  // return <HomeView />
-  redirect("/chat")
-
-}
-
-export default Page
-</file>
-
 <file path="src/app/api/auth/[...all]/route.ts">
 import { auth } from "@/lib/auth"; // path to your auth file
 import { toNextJsHandler } from "better-auth/next-js";
  
 export const { POST, GET } = toNextJsHandler(auth);
+</file>
+
+<file path="src/app/api/pdf/chat/route.ts">
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { streamText } from "ai";
+import { NextResponse } from "next/server";
+import { db } from "@/db";
+import { paperChunks, chats, messages } from "@/db/schema";
+import { generateEmbedding } from "@/lib/embed";
+import { desc, gt, sql, eq, and } from "drizzle-orm";
+import { auth } from "@/lib/auth"; 
+import { headers } from "next/headers";
+
+const google = createGoogleGenerativeAI({
+  apiKey: process.env.GEMINI_API_KEY,
+});
+
+export async function POST(req: Request) {
+  try {
+    // 1. Verify Auth
+    const session = await auth.api.getSession({
+      headers: await headers(),
+    });
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const body = await req.json();
+    const pdfId = body.pdfId || body.pdf_id;
+    const rawMessages = body.messages || [];
+    
+    // Filter empty messages
+    const chatMessages = rawMessages.filter(
+      (m: any) => m.content && m.content.trim() !== ""
+    );
+
+    const query = chatMessages.length > 0 
+      ? chatMessages[chatMessages.length - 1].content 
+      : body.query;
+
+    if (!pdfId || !query) {
+      return NextResponse.json({ error: "Missing pdfId or query" }, { status: 400 });
+    }
+
+    // 2. Retrieve or Create Chat Session
+    let chatId: string;
+    
+    const existingChat = await db
+      .select()
+      .from(chats)
+      .where(and(
+        eq(chats.userId, session.user.id),
+        eq(chats.paperId, pdfId)
+      ))
+      .limit(1);
+
+    const titleSnippet = query.substring(0, 50) + "...";
+      if (existingChat.length > 0) {
+        chatId = existingChat[0].id;
+        
+        // FIX: Update title if it's still the default "New Conversation"
+        if (existingChat[0].title === "New Conversation") {
+          await db.update(chats)
+            .set({ title: titleSnippet })
+            .where(eq(chats.id, chatId));
+        }
+      } else {
+        // Create new if missing
+        const newChat = await db.insert(chats).values({
+          userId: session.user.id,
+          paperId: pdfId,
+          title: titleSnippet, 
+        }).returning();
+        chatId = newChat[0].id;
+      }
+
+    // 3. Save USER Message to DB
+    await db.insert(messages).values({
+      chatId: chatId,
+      role: "user",
+      content: query,
+    });
+
+    // 4. RAG: Embed & Search
+    const queryVector = await generateEmbedding(query);
+    const similarity = sql<number>`1 - (${paperChunks.embedding} <=> ${JSON.stringify(queryVector)})`;
+
+    const relevantChunks = await db
+      .select({ content: paperChunks.content, score: similarity })
+      .from(paperChunks)
+      .where(and(eq(paperChunks.paperId, pdfId), gt(similarity, 0.1)))
+      .orderBy(desc(similarity))
+      .limit(15);
+
+    const context = relevantChunks.map((c) => c.content).join("\n\n");
+
+    // 5. Stream Response & Save ASSISTANT Message
+    const result = await streamText({
+      model: google("gemini-2.5-flash"),
+      system: `You are a helpful research assistant... CONTEXT: ${context || "No context found."}`,
+      messages: chatMessages.map((m: any) => ({ role: m.role, content: m.content })),
+      onFinish: async ({ text }) => {
+        // Save the AI's full response to DB when stream finishes
+        if (text) {
+          await db.insert(messages).values({
+            chatId: chatId,
+            role: "assistant",
+            content: text,
+          });
+        }
+      },
+    });
+
+    return result.toTextStreamResponse();
+
+  } catch (error: any) {
+    console.error("[Chat API] Error:", error);
+    return NextResponse.json({ error: error.message || "Internal Server Error" }, { status: 500 });
+  }
+}
+</file>
+
+<file path="src/app/api/pdf/info/route.ts">
+import { NextResponse } from "next/server";
+import { db } from "@/db";
+import { papers } from "@/db/schema";
+import { eq } from "drizzle-orm";
+
+export async function GET(req: Request) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const pdfId = searchParams.get("pdfId");
+
+    if (!pdfId) {
+      return NextResponse.json({ error: "Missing pdfId" }, { status: 400 });
+    }
+
+    const paper = await db
+      .select()
+      .from(papers)
+      .where(eq(papers.id, pdfId))
+      .limit(1);
+
+    if (paper.length === 0) {
+      return NextResponse.json({ error: "PDF not found" }, { status: 404 });
+    }
+
+    return NextResponse.json({
+      id: paper[0].id,
+      title: paper[0].title,
+      abstract: paper[0].abstract,
+      pdfUrl: paper[0].pdfUrl,
+      createdAt: paper[0].createdAt,
+    });
+  } catch (error: any) {
+    console.error("[Info API] Error:", error);
+    return NextResponse.json(
+      { error: error.message || "Internal Server Error" },
+      { status: 500 }
+    );
+  }
+}
+</file>
+
+<file path="src/app/api/pdf/load/route.ts">
+export const maxDuration = 60; 
+export const runtime = "nodejs";
+
+import { NextResponse } from "next/server";
+import { db } from "@/db";
+import { papers, paperChunks, chats } from "@/db/schema";
+import { eq, and } from "drizzle-orm";
+import { extractPdfText } from "@/lib/extract-pdf";
+import { recursiveChunkText } from "@/lib/pdf-loader";
+import { generateEmbeddings } from "@/lib/embed";
+import { redis, ensureRedis } from "@/lib/redis";
+import { createHash, randomUUID } from "crypto";
+import xml2js from "xml2js";
+import { auth } from "@/lib/auth";
+import { headers } from "next/headers";
+import { generateStructuredSummary } from "@/lib/summarize";
+
+export async function POST(req: Request) {
+  try {
+    // 1. GET SESSION (Required to create a chat)
+    const session = await auth.api.getSession({
+      headers: await headers(),
+    });
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { arxivId } = await req.json();
+    if (!arxivId) return NextResponse.json({ error: "Missing arxivId" }, { status: 400 });
+
+    const cleanId = arxivId
+      .replace(/http:\/\/arxiv\.org\/abs\//g, "")
+      .replace(/https:\/\/arxiv\.org\/abs\//g, "")
+      .replace(".pdf", "")
+      .trim();
+
+    // 2. Metadata Fetching
+    let paperTitle = `arXiv ${cleanId}`;
+    let paperAbstract = "";
+    try {
+      const metaRes = await fetch(`http://export.arxiv.org/api/query?id_list=${cleanId}`);
+      const parsed = await xml2js.parseStringPromise(await metaRes.text(), { explicitArray: false });
+      const entry = Array.isArray(parsed?.feed?.entry) ? parsed.feed.entry[0] : parsed?.feed?.entry;
+      if (entry?.title){
+        paperTitle = entry.title.replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+        paperAbstract = entry.summary?.trim() || "No abstract available.";
+      } 
+    } catch (e) { console.error("Meta fetch failed", e); }
+
+    // 3. Check Existing Paper by ArXiv ID
+    const existingPaper = await db.select().from(papers).where(eq(papers.arxivId, cleanId)).limit(1);
+    
+    let finalPdfId = "";
+
+    if (existingPaper.length > 0) {
+      finalPdfId = existingPaper[0].id;
+    } else {
+      // 4. Download PDF
+      const targetUrl = `https://arxiv.org/pdf/${cleanId}.pdf`;
+      const pdfRes = await fetch(targetUrl);
+      if (!pdfRes.ok) throw new Error("Failed to fetch PDF");
+      const buffer = Buffer.from(await pdfRes.arrayBuffer());
+      
+      const fileHash = createHash("sha256").update(buffer).digest("hex");
+      
+      // 5. Double check hash to prevent duplicate content
+      const hashCheck = await db.select().from(papers).where(eq(papers.fileHash, fileHash)).limit(1);
+      
+      if (hashCheck.length > 0) {
+        finalPdfId = hashCheck[0].id;
+      } else {
+        // 6. Process New Paper (Parse & Summarize)
+        console.log(`[ArXiv Load] Parsing ${cleanId} with Docling...`);
+        const fullText = await extractPdfText(buffer);
+
+        console.log(`[ArXiv Load] Generating Summary...`);
+        const summary = await generateStructuredSummary(fullText);
+        
+        finalPdfId = randomUUID();
+        const base64 = buffer.toString("base64");
+        
+        let storedInRedis = false;
+        try {
+          if (process.env.REDIS_URL) {
+             await ensureRedis(); 
+             await redis.set(`pdf:${finalPdfId}`, base64); 
+             storedInRedis = true; 
+          }
+        } catch (e) {
+          console.warn("Redis write failed, falling back to DB storage");
+        }
+
+        // 7. Insert with Race Condition Handling
+        try {
+          await db.insert(papers).values({
+            id: finalPdfId,
+            arxivId: cleanId,
+            title: paperTitle,
+            pdfUrl: `/api/pdf/serve?pdfId=${finalPdfId}`,
+            abstract: paperAbstract,
+            summary: summary,
+            pdfData: storedInRedis ? null : base64,
+            fileHash: fileHash,
+          });
+          
+          // Chunking & Embedding (Only if insert succeeds)
+          const chunks = recursiveChunkText(fullText, 2500, 500);
+          const BATCH_SIZE = 10;
+          for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+            const batchChunks = chunks.slice(i, i + BATCH_SIZE);
+            const embeddings = await generateEmbeddings(batchChunks);
+            await db.insert(paperChunks).values(batchChunks.map((c, idx) => ({
+              paperId: finalPdfId, content: c, embedding: embeddings[idx]
+            })));
+          }
+
+        } catch (dbError: any) {
+          // ERROR CODE 23505 = Unique Violation in Postgres
+          if (dbError.code === '23505') {
+              console.log("[Load API] Race condition detected. Paper already exists. Fetching existing ID.");
+              const existing = await db.select().from(papers).where(eq(papers.fileHash, fileHash)).limit(1);
+              if (existing.length > 0) {
+                  finalPdfId = existing[0].id;
+              } else {
+                  // If we hit a unique constraint but can't find the record, something is very wrong.
+                  throw dbError;
+              }
+          } else {
+              throw dbError; // Rethrow real errors
+          }
+        }
+      }
+    }
+
+    // 8. Create Chat Session
+    // This runs regardless of whether the paper was new or existing
+    if (!finalPdfId) {
+        throw new Error("Failed to determine PDF ID");
+    }
+
+    const existingChat = await db.select().from(chats)
+      .where(and(eq(chats.userId, session.user.id), eq(chats.paperId, finalPdfId)))
+      .limit(1);
+
+    if (existingChat.length === 0) {
+      await db.insert(chats).values({
+        userId: session.user.id,
+        paperId: finalPdfId,
+        title: "New Conversation",
+      });
+    }
+
+    return NextResponse.json({ 
+      success: true, 
+      pdfId: finalPdfId, 
+      title: paperTitle 
+    });
+
+  } catch (error: any) {
+    console.error("[Load API] Error:", error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
+</file>
+
+<file path="src/app/api/pdf/serve/route.ts">
+// src/app/api/pdf/serve/route.ts
+export const runtime = "nodejs";
+
+import { NextResponse } from "next/server";
+import { redis, ensureRedis } from "@/lib/redis";
+import { db } from "@/db";
+import { papers } from "@/db/schema";
+import { eq } from "drizzle-orm";
+
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+  const pdfId = searchParams.get("pdfId");
+
+  if (!pdfId) {
+    return NextResponse.json({ error: "Missing pdfId" }, { status: 400 });
+  }
+
+  let base64: string | null = null;
+
+  // Try Redis first
+  try {
+    await ensureRedis();
+    base64 = await redis.get(`pdf:${pdfId}`);
+  } catch (error) {
+    console.warn("[Serve API] Redis not available, checking database");
+  }
+
+  // Fallback to database if Redis doesn't have it
+  if (!base64) {
+    const paper = await db
+      .select({ pdfData: papers.pdfData })
+      .from(papers)
+      .where(eq(papers.id, pdfId))
+      .limit(1);
+
+    if (paper.length > 0 && paper[0].pdfData) {
+      base64 = paper[0].pdfData;
+    }
+  }
+
+  if (!base64) {
+    return NextResponse.json({ error: "PDF not found" }, { status: 404 });
+  }
+
+  // Convert back to binary buffer
+  const buffer = Buffer.from(base64, "base64");
+
+  return new NextResponse(buffer, {
+    headers: {
+      "Content-Type": "application/pdf",
+      "Content-Length": buffer.length.toString(),
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
+}
+</file>
+
+<file path="src/app/api/pdf/upload/route.ts">
+export const maxDuration = 60;
+export const runtime = "nodejs";
+
+import { NextResponse } from "next/server";
+import { db } from "@/db";
+import { papers, paperChunks } from "@/db/schema";
+import { eq, and } from "drizzle-orm"; 
+import { extractPdfText } from "@/lib/extract-pdf";
+import { recursiveChunkText } from "@/lib/pdf-loader";
+import { generateEmbeddings } from "@/lib/embed";
+import { randomUUID, createHash } from "crypto"; // Import createHash
+import { redis, ensureRedis } from "@/lib/redis";
+import { auth } from "@/lib/auth";
+import { headers } from "next/headers";
+import { chats } from "@/db/schema";
+import { generateStructuredSummary } from "@/lib/summarize";
+
+export async function POST(req: Request) {
+  try {
+    const session = await auth.api.getSession({ headers: await headers() });
+    if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+    const formData = await req.formData();
+    const file = formData.get("file") as File;
+
+    if (!file) {
+      return NextResponse.json({ error: "No file provided" }, { status: 400 });
+    }
+
+    if (file.type !== "application/pdf") {
+      return NextResponse.json({ error: "File must be a PDF" }, { status: 400 });
+    }
+
+    const maxSize = 10 * 1024 * 1024; // 10MB
+    if (file.size > maxSize) {
+      return NextResponse.json(
+        { error: "File size must be less than 10MB" },
+        { status: 400 }
+      );
+    }
+
+    const fileName = file.name.replace(/\.pdf$/i, "");
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // 1. GENERATE FILE HASH (SHA-256)
+    const fileHash = createHash("sha256").update(buffer).digest("hex");
+    console.log(`[Upload API] File Hash: ${fileHash}`);
+
+    // 2. CHECK FOR EXISTING PAPER BY HASH
+    const existingPaper = await db
+      .select()
+      .from(papers)
+      .where(eq(papers.fileHash, fileHash))
+      .limit(1);
+
+    if (existingPaper.length > 0) {
+      console.log(`[Upload API] Duplicate found by hash. Returning ID: ${existingPaper[0].id}`);
+      return NextResponse.json({
+        success: true,
+        pdfId: existingPaper[0].id,
+        chunks: 0,
+        title: existingPaper[0].title, // Return original title
+        message: "File already exists. Redirecting...",
+      });
+    }
+
+    // 3. Extract Text (Only if it's a new file)
+    console.log(`[Upload API] Extracting text from PDF: ${fileName}`);
+    const fullText = await extractPdfText(buffer);
+
+    // --- DEBUG: VIEW PARSING QUALITY ---
+    console.log("============== RAW PDF TEXT START ==============");
+    console.log(fullText.slice(0, 2000)); // Print first 2000 chars
+    console.log("============== RAW PDF TEXT END ==============");
+    // -----------------------------------
+
+    if (fullText.length === 0) {
+      return NextResponse.json(
+        { error: "Could not extract text from PDF" },
+        { status: 400 }
+      );
+    }
+
+    console.log(`[Upload API] Generating structured summary...`);
+    const summary = await generateStructuredSummary(fullText);
+    console.log(`[Upload API] Structured summary generated: ${summary}`);
+
+    // 4. Save New Paper
+    const pdfId = randomUUID();
+    const base64 = buffer.toString("base64");
+    let storedInRedis = false;
+    
+    try {
+      if (process.env.REDIS_URL) {
+        await ensureRedis();
+        await redis.set(`pdf:${pdfId}`, base64);
+        storedInRedis = true;
+      }
+    } catch (error) {
+      console.warn("[Upload API] Redis not available, storing PDF in database");
+    }
+
+    await db.insert(papers).values({
+      id: pdfId,
+      title: fileName || "Untitled Document",
+      pdfUrl: `/api/pdf/serve?pdfId=${pdfId}`, 
+      abstract: summary,
+      pdfData: storedInRedis ? null : base64,
+      fileHash: fileHash, // Save the hash!
+    });
+
+    // 5. Chunk and Embed
+    const chunks = recursiveChunkText(fullText, 1000, 200);
+    console.log(`[Upload API] Created ${chunks.length} text chunks.`);
+
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+      const batchChunks = chunks.slice(i, i + BATCH_SIZE);
+      const embeddings = await generateEmbeddings(batchChunks);
+
+      const valuesToInsert = batchChunks.map((chunkText, idx) => ({
+        paperId: pdfId,
+        content: chunkText,
+        embedding: embeddings[idx],
+      }));
+
+      await db.insert(paperChunks).values(valuesToInsert);
+      console.log(`[Upload API] Saved batch ${Math.ceil((i + 1) / BATCH_SIZE)}/${Math.ceil(chunks.length / BATCH_SIZE)}`);
+    }
+
+    console.log(`[Upload API] Successfully processed PDF: ${pdfId}`);
+
+    const existingChat = await db.select().from(chats)
+      .where(and(eq(chats.userId, session.user.id), eq(chats.paperId, pdfId))) // pdfId is the UUID you generated
+      .limit(1);
+
+    if (existingChat.length === 0) {
+      await db.insert(chats).values({
+        userId: session.user.id,
+        paperId: pdfId,
+        title: "New Conversation",
+      });
+    }
+    return NextResponse.json({
+      success: true,
+      pdfId: pdfId,
+      chunks: chunks.length,
+      title: fileName,
+    });
+
+  } catch (error: any) {
+    console.error("[Upload API] Error:", error);
+    return NextResponse.json(
+      { error: error.message || "Internal Server Error" },
+      { status: 500 }
+    );
+  }
+}
+</file>
+
+<file path="src/app/api/search/arxiv/route.ts">
+import { NextResponse } from "next/server";
+import xml2js from "xml2js";
+
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+  const q = searchParams.get("q") || "";
+  const category = searchParams.get("category") || "all";
+  const sortBy = searchParams.get("sortBy") || "relevance"; 
+  const sortOrder = searchParams.get("sortOrder") || "descending";
+
+  if (!q && category === "all") {
+    return NextResponse.json({ results: [] });
+  }
+
+  // Construct Query
+  let searchQuery = `all:${encodeURIComponent(q)}`;
+  if (category !== "all") {
+    searchQuery += `+AND+cat:${category}`;
+  }
+
+  const maxResults = 10;
+  const url = `http://export.arxiv.org/api/query?search_query=${searchQuery}&start=0&max_results=${maxResults}&sortBy=${sortBy}&sortOrder=${sortOrder}`;
+
+  try {
+    const response = await fetch(url);
+    const xml = await response.text();
+    const parsed = await xml2js.parseStringPromise(xml, { explicitArray: false });
+    
+    const entries = parsed.feed.entry ? (Array.isArray(parsed.feed.entry) ? parsed.feed.entry : [parsed.feed.entry]) : [];
+
+    const results = entries.map((e: any) => {
+        const categories = Array.isArray(e.category) 
+            ? e.category.map((c: any) => c.$.term) 
+            : [e.category?.$.term];
+
+        return {
+            // 1. Fix ID
+            id: e.id.replace(/http:\/\/arxiv\.org\/abs\//g, "").replace(/https:\/\/arxiv\.org\/abs\//g, "").replace("v1", ""),
+            
+            title: e.title?.replace(/\n/g, " ").trim(),
+            
+            // 2. FIX: Map 'summary' to 'abstract' to match UI component
+            abstract: e.summary?.trim() || "No abstract available.",
+            
+            // 3. Fix Authors (Ensure it is a string, not array/object)
+            authors: e.author 
+                ? (Array.isArray(e.author) 
+                    ? e.author.map((a: any) => a.name).join(", ") 
+                    : e.author.name)
+                : "Unknown",
+            
+            published: e.published,
+            updated: e.updated,
+            categories: categories,
+            pdfUrl: e.link?.find?.((l: any) => l.$.type === "application/pdf")?.$.href ?? null,
+        };
+    });
+
+    return NextResponse.json({ results });
+  } catch (error) {
+    console.error("ArXiv Search Error:", error);
+    return NextResponse.json({ results: [] }, { status: 500 });
+  }
+}
 </file>
 
 <file path="src/app/api/trpc/[trpc]/route.ts">
@@ -6881,79 +7057,154 @@ export const GeneratedAvatar = ({
 }
 </file>
 
+<file path="src/components/pdf-upload.tsx">
+"use client";
+
+import { Upload, FileText, X } from 'lucide-react';
+import { useState } from 'react';
+
+interface PDFUploadProps {
+  onPDFSelect: (file: File) => void;
+  loading?: boolean;
+}
+
+export default function PDFUpload({ onPDFSelect, loading = false }: PDFUploadProps) {
+  const [dragActive, setDragActive] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+
+  const handleDrag = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === 'dragenter' || e.type === 'dragover') {
+      setDragActive(true);
+    } else if (e.type === 'dragleave') {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      const file = e.dataTransfer.files[0];
+      if (file.type === 'application/pdf') {
+        setSelectedFile(file);
+        onPDFSelect(file);
+      }
+    }
+  };
+
+  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      if (file.type === 'application/pdf') {
+        setSelectedFile(file);
+        onPDFSelect(file);
+      }
+    }
+  };
+
+  const handleRemove = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setSelectedFile(null);
+  };
+
+  return (
+    <div className="flex items-center justify-center min-h-screen bg-white">
+      <div className="w-full max-w-2xl px-8">
+        <div className="text-center mb-8">
+          <h1 className="text-4xl font-bold text-slate-900 mb-3">
+            Chat with PDF
+          </h1>
+          <p className="text-lg text-slate-600">
+            Upload a PDF document to start chatting with it
+          </p>
+        </div>
+
+        {selectedFile ? (
+          <div className="border-2 border-emerald-500 rounded-2xl p-8 bg-emerald-50">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-4">
+                <div className="w-12 h-12 bg-emerald-100 rounded-lg flex items-center justify-center">
+                  <FileText className="w-6 h-6 text-emerald-600" />
+                </div>
+                <div>
+                  <p className="font-semibold text-slate-900">{selectedFile.name}</p>
+                  <p className="text-sm text-slate-600">
+                    {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
+                  </p>
+                </div>
+              </div>
+              {!loading && (
+                <button
+                  onClick={handleRemove}
+                  className="p-2 hover:bg-emerald-200 rounded-lg transition-colors"
+                >
+                  <X className="w-5 h-5 text-slate-600" />
+                </button>
+              )}
+            </div>
+            {loading && (
+              <div className="mt-4">
+                <div className="w-full bg-emerald-200 rounded-full h-2">
+                  <div className="bg-emerald-600 h-2 rounded-full animate-pulse" style={{ width: '60%' }}></div>
+                </div>
+                <p className="text-sm text-emerald-700 mt-2 text-center">
+                  Processing PDF...
+                </p>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div
+            className={`relative border-2 border-dashed rounded-2xl p-12 transition-all ${
+              dragActive
+                ? 'border-emerald-500 bg-emerald-50'
+                : 'border-slate-300 hover:border-slate-400 bg-white'
+            }`}
+            onDragEnter={handleDrag}
+            onDragLeave={handleDrag}
+            onDragOver={handleDrag}
+            onDrop={handleDrop}
+          >
+            <input
+              type="file"
+              accept="application/pdf"
+              onChange={handleFileInput}
+              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+              disabled={loading}
+            />
+            <div className="flex flex-col items-center text-center">
+              <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center mb-4">
+                <Upload className="w-8 h-8 text-emerald-600" />
+              </div>
+              <h3 className="text-xl font-semibold text-slate-900 mb-2">
+                Drop your PDF here
+              </h3>
+              <p className="text-slate-600 mb-4">
+                or click to browse from your computer
+              </p>
+              <p className="text-sm text-slate-500">
+                Supports PDF files up to 10MB
+              </p>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-8 text-center text-sm text-slate-500">
+          Your documents are processed securely and never shared
+        </div>
+      </div>
+    </div>
+  );
+}
+</file>
+
 <file path="src/db/index.ts">
 import { drizzle } from "drizzle-orm/neon-http";
 
 export const db = drizzle(process.env.DATABASE_URL!);
-</file>
-
-<file path="src/db/schema.ts">
-import { pgTable, text, timestamp, boolean, uuid, vector, index, } from "drizzle-orm/pg-core";
-
-export const user = pgTable("user", {
-    id: text('id').primaryKey(),
-    name: text('name').notNull(),
-    email: text('email').notNull().unique(),
-    emailVerified: boolean('email_verified').$defaultFn(() => false).notNull(),
-    image: text('image'),
-    createdAt: timestamp('created_at').$defaultFn(() => /* @__PURE__ */ new Date()).notNull(),
-    updatedAt: timestamp('updated_at').$defaultFn(() => /* @__PURE__ */ new Date()).notNull()
-});
-
-export const session = pgTable("session", {
-    id: text('id').primaryKey(),
-    expiresAt: timestamp('expires_at').notNull(),
-    token: text('token').notNull().unique(),
-    createdAt: timestamp('created_at').notNull(),
-    updatedAt: timestamp('updated_at').notNull(),
-    ipAddress: text('ip_address'),
-    userAgent: text('user_agent'),
-    userId: text('user_id').notNull().references(()=> user.id, { onDelete: 'cascade' })
-});
-
-export const account = pgTable("account", {
-    id: text('id').primaryKey(),
-    accountId: text('account_id').notNull(),
-    providerId: text('provider_id').notNull(),
-    userId: text('user_id').notNull().references(()=> user.id, { onDelete: 'cascade' }),
-    accessToken: text('access_token'),
-    refreshToken: text('refresh_token'),
-    idToken: text('id_token'),
-    accessTokenExpiresAt: timestamp('access_token_expires_at'),
-    refreshTokenExpiresAt: timestamp('refresh_token_expires_at'),
-    scope: text('scope'),
-    password: text('password'),
-    createdAt: timestamp('created_at').notNull(),
-    updatedAt: timestamp('updated_at').notNull()
-});
-
-export const verification = pgTable("verification", {
-    id: text('id').primaryKey(),
-    identifier: text('identifier').notNull(),
-    value: text('value').notNull(),
-    expiresAt: timestamp('expires_at').notNull(),
-    createdAt: timestamp('created_at').$defaultFn(() => /* @__PURE__ */ new Date()),
-    updatedAt: timestamp('updated_at').$defaultFn(() => /* @__PURE__ */ new Date())
-});
-
-export const papers = pgTable("papers", {
-    id: text("id").primaryKey(),
-    title: text("title").notNull(),
-    abstract: text("abstract"),
-    pdfUrl: text("pdf_url"),
-    pdfData: text("pdf_data"), // Base64 encoded PDF as fallback when Redis is not available
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-  });
-  
-  export const paperChunks = pgTable("paper_chunks", {
-    id: uuid("id").defaultRandom().primaryKey(),
-    paperId: text("paper_id").references(() => papers.id, { onDelete: "cascade" }).notNull(),
-    content: text("content").notNull(),
-    // Jina v3 default dimension is 1024
-    embedding: vector("embedding", { dimensions: 1024 }), 
-  }, (table) => ({
-    embeddingIndex: index("embeddingIndex").using("hnsw", table.embedding.op("vector_cosine_ops")),
-  }));
 </file>
 
 <file path="src/hooks/use-mobile.ts">
@@ -6975,6 +7226,72 @@ export function useIsMobile() {
   }, [])
 
   return !!isMobile
+}
+</file>
+
+<file path="src/lib/arxiv.ts">
+// src/lib/arxiv.ts
+// Server-side arXiv search. No external libs. Raw HTTP + XML parsing.
+
+export async function searchArxiv(query: string, maxResults = 5): Promise<Paper[]> {
+  if (!query.trim()) return [];
+
+  const encodedQuery = encodeURIComponent(query);
+  const url = `http://export.arxiv.org/api/query?search_query=all:${encodedQuery}&start=0&max_results=${maxResults}&sortBy=relevance&sortOrder=descending`;
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`arXiv API error: ${response.status}`);
+
+    const xml = await response.text();
+
+    // Simple XML → JSON parser (no deps, handles arXiv's Atom format)
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xml, "text/xml");
+    const entries = doc.querySelectorAll("entry");
+
+    const papers: Paper[] = [];
+    entries.forEach((entry) => {
+      const id = entry.querySelector("id")?.textContent?.replace("http://arxiv.org/abs/", "") || "";
+      const title = entry.querySelector("title")?.textContent?.trim() || "Untitled";
+      const summary = entry.querySelector("summary")?.textContent?.trim() || "";
+      
+      const authors = Array.from(entry.querySelectorAll("author name")).map((author) => author.textContent?.trim() || "Unknown");
+      
+      const published = entry.querySelector("published")?.textContent || new Date().toISOString();
+      
+      const pdfLink = Array.from(entry.querySelectorAll("link"))
+        .find((link) => link.getAttribute("title") === "pdf")?.getAttribute("href") || 
+        `https://arxiv.org/pdf/${id}.pdf`;
+      
+      const category = entry.querySelector("arxiv:primary_category")?.getAttribute("term") || "unknown";
+
+      papers.push({
+        id,
+        title,
+        authors,
+        published,
+        abstract: summary,
+        pdfUrl: pdfLink,
+        category,
+      });
+    });
+
+    return papers;
+  } catch (error) {
+    console.error("arXiv search failed:", error);
+    return [];
+  }
+}
+
+export interface Paper {
+  id: string;
+  title: string;
+  authors: string[];
+  published: string;
+  abstract: string;
+  pdfUrl: string;
+  category: string;
 }
 </file>
 
@@ -7162,6 +7479,241 @@ export const auth = betterAuth({
         }
     }),
 });
+</file>
+
+<file path="src/lib/chunk.ts">
+export function chunk(text: string, size = 1200) {
+    const words = text.split(" ");
+    const chunks = [];
+    for (let i = 0; i < words.length; i += size) {
+      chunks.push(words.slice(i, i + size).join(" "));
+    }
+    return chunks;
+  }
+  
+  export function chunkText(text: string, size = 1200): string[] {
+    const words = text.split(/\s+/);
+    const result: string[] = [];
+  
+    for (let i = 0; i < words.length; i += size) {
+      result.push(words.slice(i, i + size).join(" "));
+    }
+  
+    return result;
+  }
+</file>
+
+<file path="src/lib/embed.ts">
+const JINA_API_KEY = process.env.JINA_API_KEY;
+
+export async function generateEmbedding(text: string): Promise<number[]> {
+  const embeddings = await generateEmbeddings([text]);
+  return embeddings[0];
+}
+
+export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
+  if (!JINA_API_KEY) throw new Error("JINA_API_KEY is not set");
+
+  const response = await fetch("https://api.jina.ai/v1/embeddings", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${JINA_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "jina-embeddings-v3", // SOTA model
+      // 'retrieval.passage' optimizes vectors for storage/indexing
+      task: "retrieval.passage", 
+      dimensions: 1024,
+      late_chunking: false,
+      input: texts,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Jina API Error: ${response.statusText}`);
+  }
+
+  const data = await response.json();
+  return data.data.map((d: any) => d.embedding);
+}
+</file>
+
+<file path="src/lib/extract-pdf.ts">
+// Use unpdf - platform-agnostic PDF.js for serverless environments
+// Inspired by: https://github.com/RihanArfan/chat-with-pdf
+import { getDocumentProxy, extractText } from 'unpdf'
+
+// export async function extractPdfText(buffer: Buffer): Promise<string> {
+//   try {
+//     // Convert Buffer to Uint8Array for unpdf
+//     const uint8Array = new Uint8Array(buffer);
+    
+//     // Get document proxy
+//     const pdf = await getDocumentProxy(uint8Array);
+    
+//     // Extract text with mergePages option to combine all pages
+//     const result = await extractText(pdf, { mergePages: true });
+    
+//     // Handle both array and string results
+//     return Array.isArray(result.text) ? result.text.join(' ') : result.text || "";
+//   } catch (error: any) {
+//     console.error("Error extracting PDF text:", error);
+//     throw new Error(`Failed to extract text from PDF: ${error.message}`);
+//   }
+// }
+
+// src/lib/extract-pdf.ts
+
+// src/lib/extract-pdf.ts
+export async function extractPdfText(buffer: Buffer): Promise<string> {
+  try {
+    // FIX: Convert Node Buffer to standard Uint8Array to satisfy Blob type
+    const blob = new Blob([new Uint8Array(buffer)], { type: 'application/pdf' });
+    
+    const formData = new FormData();
+    formData.append("file", blob, "paper.pdf");
+
+    // Call your local Python Docling service
+    const response = await fetch("http://127.0.0.1:8000/parse", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+        throw new Error(`Docling service error: ${response.statusText}`);
+    }
+    
+    const data = await response.json();
+    return data.text; // Returns high-quality Markdown
+  } catch (error) {
+    console.error("Docling parsing failed:", error);
+    throw error; 
+  }
+}
+</file>
+
+<file path="src/lib/memory-store.ts">
+export const memoryStore: Record<
+  string,
+  { chunks: string[]; embeddings: number[][]; filePath: string }
+> = {};
+</file>
+
+<file path="src/lib/pdf-loader.ts">
+// Use unpdf - platform-agnostic PDF.js for serverless environments
+import { getDocumentProxy, extractText } from 'unpdf'
+ 
+export async function getPdfTextFromUrl(url: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Failed to fetch PDF: ${response.statusText}`);
+  
+  const arrayBuffer = await response.arrayBuffer();
+  const uint8Array = new Uint8Array(arrayBuffer);
+  
+  // Get document proxy
+  const pdf = await getDocumentProxy(uint8Array);
+  
+  // Extract text with mergePages option to combine all pages
+  const result = await extractText(pdf, { mergePages: true });
+  
+  // Handle both array and string results
+  return Array.isArray(result.text) ? result.text.join(' ') : result.text || "";
+}
+
+export function recursiveChunkText(text: string, chunkSize = 1000, overlap = 200): string[] {
+  const chunks: string[] = [];
+  let startIndex = 0;
+
+  while (startIndex < text.length) {
+    let endIndex = startIndex + chunkSize;
+    
+    // Try to find a sentence break to avoid cutting words/sentences awkwardly
+    if (endIndex < text.length) {
+      const nextSpace = text.indexOf(' ', endIndex);
+      if (nextSpace !== -1 && nextSpace - endIndex < 100) {
+        endIndex = nextSpace;
+      }
+    }
+
+    const chunk = text.slice(startIndex, endIndex).replace(/\s+/g, " ").trim();
+    if (chunk.length > 0) {
+      chunks.push(chunk);
+    }
+
+    startIndex += (chunkSize - overlap);
+  }
+
+  return chunks;
+}
+</file>
+
+<file path="src/lib/redis.ts">
+// src/lib/redis.ts
+import { createClient } from "redis";
+
+const redisUrl = process.env.REDIS_URL;
+
+let redisClient: ReturnType<typeof createClient> | null = null;
+let started = false;
+
+// Create Redis client if URL is provided
+if (redisUrl) {
+  redisClient = createClient({ url: redisUrl });
+  
+  redisClient.on("error", (err) => {
+    console.error("Redis Client Error:", err);
+  });
+}
+
+export const redis = {
+  async get(key: string): Promise<string | null> {
+    if (!redisClient) {
+      console.warn("Redis not configured. PDF serving will not work. Set REDIS_URL environment variable.");
+      return null;
+    }
+    if (!started) {
+      await ensureRedis();
+    }
+    try {
+      return await redisClient.get(key);
+    } catch (error) {
+      console.error("Redis get error:", error);
+      return null;
+    }
+  },
+  async set(key: string, value: string): Promise<void> {
+    if (!redisClient) {
+      console.warn("Redis not configured. PDF storage will not work. Set REDIS_URL environment variable.");
+      return;
+    }
+    if (!started) {
+      await ensureRedis();
+    }
+    try {
+      await redisClient.set(key, value);
+    } catch (error) {
+      console.error("Redis set error:", error);
+    }
+  },
+};
+
+export async function ensureRedis() {
+  if (!redisClient) {
+    console.warn("Redis not configured. Set REDIS_URL environment variable to enable PDF storage.");
+    return;
+  }
+  if (!started) {
+    try {
+      await redisClient.connect();
+      started = true;
+      console.log("Redis connected successfully");
+    } catch (error) {
+      console.error("Failed to connect to Redis:", error);
+      throw error;
+    }
+  }
+}
 </file>
 
 <file path="src/lib/utils.ts">
@@ -7623,178 +8175,6 @@ export const DashboardCommand = ({ open, setOpen}: Props) => {
 }
 </file>
 
-<file path="src/modules/dashboard/ui/components/dashboard-navbar.tsx">
-"use client"
-
-import { Button } from "@/components/ui/button"
-import { useSidebar } from "@/components/ui/sidebar"
-import { PanelLeftCloseIcon, PanelLeftIcon, SearchIcon } from "lucide-react"
-import { DashboardCommand } from "./dashboard-command"
-import { useEffect, useState } from "react"
-
-export const DashboardNavbar = () => {
-    const { state, toggleSidebar, isMobile} = useSidebar();
-    const [commandOpen, setCommandOpen] = useState(false)
-
-    useEffect(() => {
-        const down = (e: KeyboardEvent) => {
-            if(e.key === "k" && (e.metaKey || e.ctrlKey)) {
-                e.preventDefault()
-                setCommandOpen((open) => !open);
-            }
-        }; 
-
-        document.addEventListener("keydown", down);
-        return () => document.removeEventListener("keydown", down)
-    },[])
-    return (
-        <>
-            <DashboardCommand open={commandOpen} setOpen={setCommandOpen} />
-            <nav className="flex px-4 gap-x-2 items-center py-3 border bg-background">
-                <Button className="size-9" variant={"outline"} onClick={toggleSidebar}>
-                    {(state === "collapsed" || isMobile) 
-                    ? <PanelLeftIcon className="size-4" /> 
-                    : <PanelLeftCloseIcon className="size-4" /> } 
-                </Button>
-                <Button 
-                variant={"outline"}
-                size={"sm"}
-                onClick={() => setCommandOpen((open) => !open)}
-                className="h-9 w-[240px] justify-start font-normal text-muted-foreground hover:text-muted-foreground"
-                >
-                    <SearchIcon />
-                    Search Papers
-                    <kbd className="ml-auto pointer-events-none inline-flex h-5 select-none items-center gap-1 bg-muted border px-1.5 font-mono text-[10px] rounded font-medium text-muted-foreground">
-                        <span className="text-xs">&#8984;</span>K
-                    </kbd>
-                </Button>
-            </nav>
-        </>
-    )
-}
-</file>
-
-<file path="src/modules/dashboard/ui/components/dashboard-sidebar.tsx">
-"use client"
-
-import { 
-    Sidebar,
-    SidebarHeader,
-    SidebarContent,
-    SidebarFooter,
-    SidebarGroup,
-    SidebarGroupLabel,
-    SidebarGroupContent,
-    SidebarMenuItem,
-    SidebarMenu,
-    SidebarMenuButton,
-} from "@/components/ui/sidebar"
-import { BotIcon, FileIcon, HistoryIcon, HomeIcon, SparkleIcon, StarIcon, VideoIcon, Zap, FileText } from "lucide-react"
-import Link from "next/link"
-import Image from "next/image"
-import { Separator } from "@/components/ui/separator"
-import { cn } from "@/lib/utils"
-import { usePathname } from "next/navigation"
-import { DashboardUserButton } from "./dashboard-user-button"
-
-const firstSection = [
-    {
-        icon: HomeIcon,
-        label: "Home",
-        href: "/",
-    },
-    {
-        icon: FileIcon,
-        label: "My PDFs",
-        href: "/my-pdfs",
-    },
-    {
-        icon: HistoryIcon,
-        label: "History",
-        href: "/history",
-    }
-]
-const secondSection = [
-    {
-        icon: StarIcon,
-        label: "Upgrade",
-        href: "/upgrade",
-    }
-]
-
-export const DashboardSidebar = () => {
-    const pathname = usePathname();
-
-    return (
-        <Sidebar>
-            <SidebarHeader className="text-sidebar-accent-foreground">
-                <Link href={"/"} className="flex items-center gap-2 px-2 pt-2">
-                    <Image src={"/logo.svg"} alt="logo" width={36} height={36} />
-                    <p className="text-2xl font-semibold">Kluq.AI</p>
-                </Link>
-            </SidebarHeader>
-            <div className="px-4 py-2">
-                <Separator className="opacity-10 text-[#5D6B68]" />
-            </div>
-            <SidebarContent>
-                <SidebarGroup>
-                    <SidebarGroupContent>
-                        <SidebarMenu>
-                            {firstSection.map((item) => (
-                                <SidebarMenuItem key={item.href}>
-                                    <SidebarMenuButton 
-                                        asChild
-                                        className={cn(
-                                            "h-10 hover:bg-linear-to-r/oklch border border-transparent hover:border-[#5D6B68]/10 from-sidebar-accent from-5% via-30% via-sidebar/50 to-sidebar/50",
-                                            pathname === item.href && "bg-linear-to-r/oklch border-[#5D6B68]/10"
-                                        )}
-                                        isActive={pathname === item.href}
-                                    >
-                                        <Link href={item.href}>
-                                            <item.icon className="size-5" />
-                                            <span className="text-sm font-medium tracking-tight">{item.label}</span>
-                                        </Link>
-                                    </SidebarMenuButton>
-                                </SidebarMenuItem>
-                            ))}
-                        </SidebarMenu>
-                    </SidebarGroupContent>
-                </SidebarGroup>
-                <div className="px-4 py-2">
-                    <Separator className="opacity-10 text-[#5D6B68]" />
-                </div>
-                <SidebarGroup>
-                    <SidebarGroupContent>
-                        <SidebarMenu>
-                            {secondSection.map((item) => (
-                                <SidebarMenuItem key={item.href}>
-                                    <SidebarMenuButton 
-                                        asChild
-                                        className={cn(
-                                            "h-10 hover:bg-linear-to-r/oklch border border-transparent hover:border-[#5D6B68]/10 from-sidebar-accent from-5% via-30% via-sidebar/50 to-sidebar/50",
-                                            pathname === item.href && "bg-linear-to-r/oklch border-[#5D6B68]/10"
-                                        )}
-                                        isActive={pathname === item.href}
-                                    >
-                                        <Link href={item.href}>
-                                            <item.icon className="size-5" />
-                                            <span className="text-sm font-medium tracking-tight">{item.label}</span>
-                                        </Link>
-                                    </SidebarMenuButton>
-                                </SidebarMenuItem>
-                            ))}
-                        </SidebarMenu>
-                    </SidebarGroupContent>
-                </SidebarGroup>
-            </SidebarContent>
-            <SidebarFooter className="text-white">
-                <DashboardUserButton />
-            </SidebarFooter>
-        </Sidebar>
-    )
-}
-</file>
-
 <file path="src/modules/dashboard/ui/components/dashboard-user-button.tsx">
 import { GeneratedAvatar } from "@/components/generated-avatar";
 import { Avatar, AvatarImage } from "@/components/ui/avatar";
@@ -7944,6 +8324,334 @@ export const DashboardUserButton = () => {
             </DropdownMenuContent>
         </DropdownMenu>
     )
+}
+</file>
+
+<file path="src/modules/search/ui/components/paper-card.tsx">
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { MessageSquare, Loader2, Calendar, ExternalLink, ChevronDown, ChevronUp, BotIcon } from "lucide-react";
+import { format } from "date-fns";
+import { cn } from "@/lib/utils";
+
+export interface Paper {
+  id: string;
+  title: string;
+  authors: string;
+  published: string;
+  abstract: string;
+  pdfUrl: string;
+  categories: string[];
+}
+
+export function PaperCard({ paper }: { paper: Paper }) {
+  const router = useRouter();
+  const [isLoading, setIsLoading] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(false); // State for See More/Less
+
+  const handleChatClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      setIsLoading(true);
+      
+      const res = await fetch("/api/pdf/load", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ arxivId: paper.id }),
+      });
+
+      if (!res.ok) throw new Error("Failed to load paper");
+      const data = await res.json();
+      router.push(`/chat/${data.pdfId}`);
+      
+    } catch (error) {
+      console.error("Error loading paper:", error);
+      setIsLoading(false); 
+    }
+  };
+
+  const formattedDate = isNaN(new Date(paper.published).getTime()) 
+    ? paper.published 
+    : format(new Date(paper.published), "MMM d, yyyy");
+
+  return (
+    <div className="group border border-slate-200 rounded-xl p-5 hover:shadow-md transition-all bg-white hover:border-emerald-200/50 flex flex-col gap-4">
+      
+      {/* TOP ROW: Metadata & Actions */}
+      <div className="flex justify-between items-start gap-4">
+        <div className="flex-1 space-y-2">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground flex-wrap">
+             <Badge variant="outline" className="bg-slate-50 text-slate-600 font-mono text-[10px] py-0 h-5">
+                {paper.id}
+             </Badge>
+             <span className="flex items-center gap-1">
+                <Calendar className="h-3 w-3" />
+                {formattedDate}
+             </span>
+             {paper.categories.slice(0, 3).map(cat => (
+                 <span key={cat} className="bg-slate-100 px-1.5 py-0.5 rounded text-[10px] font-medium text-slate-600">
+                    {cat}
+                 </span>
+             ))}
+          </div>
+
+          <h3 className="text-lg font-bold text-slate-900 leading-tight group-hover:text-emerald-700 transition-colors">
+            <a href={`https://arxiv.org/abs/${paper.id}`} target="_blank" rel="noreferrer">
+                {paper.title}
+            </a>
+          </h3>
+          
+          <p className="text-sm font-medium text-slate-600 line-clamp-1">
+            {paper.authors}
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-2 shrink-0">
+            <Button 
+            size="sm" 
+            onClick={handleChatClick} 
+            disabled={isLoading}
+            className="bg-slate-900 text-white hover:bg-emerald-600 hover:cursor-pointer transition-colors shadow-none h-9 px-4"
+            >
+            {isLoading ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+                // <MessageSquare className="mr-2 h-4 w-4" />
+                <BotIcon className="mr-1 size-5" />
+            )}
+            {isLoading ? "..." : "Chat"}
+            </Button>
+        </div>
+      </div>
+
+      {/* BOTTOM: Abstract with "See More" */}
+      <div className="relative">
+        <p 
+            className={cn(
+                "text-slate-600 text-sm leading-relaxed transition-all",
+                !isExpanded && "line-clamp-5" // Truncate if not expanded
+            )}
+        >
+            {paper.abstract}
+        </p>
+        
+        <div className="flex items-center justify-between mt-2">
+            <button 
+                onClick={(e) => {
+                    e.stopPropagation();
+                    setIsExpanded(!isExpanded);
+                }}
+                className="text-xs font-medium text-slate-500 hover:text-slate-800 flex items-center gap-1 transition-colors focus:outline-none"
+            >
+                {isExpanded ? (
+                    <>See Less <ChevronUp className="h-3 w-3" /></>
+                ) : (
+                    <>See More <ChevronDown className="h-3 w-3" /></>
+                )}
+            </button>
+
+            {/* PDF Link */}
+            <a href={paper.pdfUrl} target="_blank" className="text-xs font-medium text-slate-400 hover:text-emerald-600 flex items-center gap-1 transition-colors">
+                <ExternalLink className="h-3 w-3" />
+                Original PDF
+            </a>
+        </div>
+      </div>
+    </div>
+  );
+}
+</file>
+
+<file path="src/modules/search/ui/views/search-view.tsx">
+"use client"
+
+import { useState, useEffect, useCallback } from "react"
+import { Input } from "@/components/ui/input"
+import { Button } from "@/components/ui/button"
+import { SearchIcon, Filter, ArrowUpDown, Loader2 } from "lucide-react"
+import { PaperCard } from "@/modules/search/ui/components/paper-card"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { CuratedTopics } from "@/modules/search/ui/components/curated-topics"
+import { useRouter, useSearchParams } from "next/navigation"
+
+const CATEGORIES = [
+    { value: "all", label: "All Categories" },
+    { value: "cs.AI", label: "Artificial Intelligence (cs.AI)" },
+    { value: "cs.LG", label: "Machine Learning (cs.LG)" },
+    { value: "cs.CL", label: "Computation & Language (NLP)" },
+    { value: "cs.CV", label: "Computer Vision (cs.CV)" },
+    { value: "cs.RO", label: "Robotics (cs.RO)" },
+    { value: "cs.MA", label: "Multiagent Systems (cs.MA)" },
+]
+
+const SORT_OPTIONS = [
+    { value: "relevance", label: "Relevance" },
+    { value: "submittedDate", label: "Submission Date" },
+    { value: "lastUpdatedDate", label: "Last Updated" },
+]
+
+export default function SearchView() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // Initialize state from URL params if they exist
+  const [query, setQuery] = useState(searchParams.get("q") || "");
+  const [category, setCategory] = useState(searchParams.get("category") || "all");
+  const [sortBy, setSortBy] = useState(searchParams.get("sortBy") || "relevance");
+  
+  const [results, setResults] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [hasSearched, setHasSearched] = useState(false);
+
+  // The actual API call
+  const performSearch = useCallback(async (searchQuery: string, searchCat: string, searchSort: string) => {
+    if (!searchQuery.trim()) return;
+    
+    setLoading(true);
+    setHasSearched(true);
+    
+    try {
+      const params = new URLSearchParams({
+          q: searchQuery,
+          category: searchCat,
+          sortBy: searchSort,
+          sortOrder: "descending"
+      });
+      
+      const res = await fetch(`/api/search/arxiv?${params.toString()}`);
+      const data = await res.json();
+      setResults(data.results || []);
+    } catch (error) {
+      console.error("Search failed:", error);
+      setResults([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // 1. Handle User Interaction (Click Search)
+  const handleSearchClick = () => {
+    if (!query.trim()) return;
+
+    // Update URL
+    const params = new URLSearchParams();
+    params.set("q", query);
+    if (category !== "all") params.set("category", category);
+    if (sortBy !== "relevance") params.set("sortBy", sortBy);
+    
+    router.push(`/search?${params.toString()}`);
+    
+    // Trigger Search
+    performSearch(query, category, sortBy);
+  };
+
+  // 2. Handle Initial Load / URL Changes
+  useEffect(() => {
+    const urlQuery = searchParams.get("q");
+    const urlCat = searchParams.get("category") || "all";
+    const urlSort = searchParams.get("sortBy") || "relevance";
+
+    if (urlQuery) {
+        setQuery(urlQuery);
+        setCategory(urlCat);
+        setSortBy(urlSort);
+        performSearch(urlQuery, urlCat, urlSort);
+    }
+  }, [searchParams, performSearch]);
+
+  return (
+    <div className="w-full flex flex-col items-center py-10 px-4 md:px-8 min-h-screen bg-slate-50/50">
+      <div className="mb-10 text-center space-y-2">
+        <h1 className="text-4xl font-bold text-slate-900 tracking-tight">Research Assistant</h1>
+        <p className="text-muted-foreground text-lg">
+            Search 2M+ papers from ArXiv with AI-powered analysis
+        </p>
+      </div>
+
+      {/* SEARCH & FILTER TOOLBAR */}
+      <div className="w-full max-w-4xl mb-12 space-y-4">
+        <div className="flex gap-3">
+            <Input
+                placeholder="Search papers (e.g. 'LLM reasoning', 'diffusion models')"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleSearchClick()}
+                className="text-lg h-12 shadow-sm border-slate-200 focus-visible:ring-emerald-500"
+            />
+            <Button 
+                onClick={handleSearchClick} 
+                size="lg" 
+                disabled={loading} 
+                className="bg-emerald-600 hover:bg-emerald-700 text-white px-8 h-12 font-medium"
+            >
+                {loading ? (
+                    <Loader2 className="mr-2 h-5 w-5 animate-spin" /> 
+                ) : (
+                    <SearchIcon className="mr-2 h-5 w-5" />
+                )}
+                Search
+            </Button>
+        </div>
+
+        {/* FILTERS */}
+        <div className="flex flex-wrap gap-3">
+            <Select value={category} onValueChange={setCategory}>
+                <SelectTrigger className="w-[240px] h-10 bg-white border-slate-200">
+                    <Filter className="mr-2 h-4 w-4 text-muted-foreground" />
+                    <SelectValue placeholder="Category" />
+                </SelectTrigger>
+                <SelectContent>
+                    {CATEGORIES.map((c) => (
+                        <SelectItem key={c.value} value={c.value}>{c.label}</SelectItem>
+                    ))}
+                </SelectContent>
+            </Select>
+
+            <Select value={sortBy} onValueChange={setSortBy}>
+                <SelectTrigger className="w-[180px] h-10 bg-white border-slate-200">
+                    <ArrowUpDown className="mr-2 h-4 w-4 text-muted-foreground" />
+                    <SelectValue placeholder="Sort by" />
+                </SelectTrigger>
+                <SelectContent>
+                    {SORT_OPTIONS.map((s) => (
+                        <SelectItem key={s.value} value={s.value}>{s.label}</SelectItem>
+                    ))}
+                </SelectContent>
+            </Select>
+        </div>
+      </div>
+
+      {/* SHOW CURATED TOPICS ONLY IF NO SEARCH ACTIVE */}
+      {!hasSearched && !query && (
+        <div className="w-full max-w-4xl animate-in fade-in slide-in-from-bottom-4 duration-700">
+            <CuratedTopics />
+        </div>
+      )}
+
+      {/* SEARCH RESULTS */}
+      <div className="w-full max-w-4xl space-y-6">
+        {results.map((paper) => (
+          <PaperCard key={paper.id} paper={paper} />
+        ))}
+        
+        {!loading && hasSearched && results.length === 0 && (
+          <div className="text-center py-20 bg-white rounded-xl border border-dashed border-slate-200 shadow-sm">
+            <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-slate-100 mb-4">
+                <SearchIcon className="h-6 w-6 text-slate-400" />
+            </div>
+            <h3 className="text-lg font-medium text-slate-900">No papers found</h3>
+            <p className="text-muted-foreground max-w-xs mx-auto mt-1">
+                We couldn't find anything matching &quot;{query}&quot;. Try different keywords or check your filters.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  )
 }
 </file>
 
@@ -8265,6 +8973,383 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 }
 </file>
 
+<file path="src/app/(dashboard)/page.tsx">
+import { auth } from "@/lib/auth"
+import { headers } from "next/headers"
+import { redirect } from "next/navigation"
+
+const Page = async () => {
+  const session = await auth.api.getSession({
+    headers: await headers(),
+  })
+
+  if (!session) {
+    redirect("/sign-in")
+  }
+
+  // Redirect to convert page as the default
+  // return <HomeView />
+  redirect("/chat")
+
+}
+
+export default Page
+</file>
+
+<file path="src/db/schema.ts">
+import { pgTable, text, timestamp, boolean, uuid, vector, index, pgEnum, } from "drizzle-orm/pg-core";
+
+export const user = pgTable("user", {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    email: text('email').notNull().unique(),
+    emailVerified: boolean('email_verified').$defaultFn(() => false).notNull(),
+    image: text('image'),
+    createdAt: timestamp('created_at').$defaultFn(() => /* @__PURE__ */ new Date()).notNull(),
+    updatedAt: timestamp('updated_at').$defaultFn(() => /* @__PURE__ */ new Date()).notNull()
+});
+
+export const session = pgTable("session", {
+    id: text('id').primaryKey(),
+    expiresAt: timestamp('expires_at').notNull(),
+    token: text('token').notNull().unique(),
+    createdAt: timestamp('created_at').notNull(),
+    updatedAt: timestamp('updated_at').notNull(),
+    ipAddress: text('ip_address'),
+    userAgent: text('user_agent'),
+    userId: text('user_id').notNull().references(()=> user.id, { onDelete: 'cascade' })
+});
+
+export const account = pgTable("account", {
+    id: text('id').primaryKey(),
+    accountId: text('account_id').notNull(),
+    providerId: text('provider_id').notNull(),
+    userId: text('user_id').notNull().references(()=> user.id, { onDelete: 'cascade' }),
+    accessToken: text('access_token'),
+    refreshToken: text('refresh_token'),
+    idToken: text('id_token'),
+    accessTokenExpiresAt: timestamp('access_token_expires_at'),
+    refreshTokenExpiresAt: timestamp('refresh_token_expires_at'),
+    scope: text('scope'),
+    password: text('password'),
+    createdAt: timestamp('created_at').notNull(),
+    updatedAt: timestamp('updated_at').notNull()
+});
+
+export const verification = pgTable("verification", {
+    id: text('id').primaryKey(),
+    identifier: text('identifier').notNull(),
+    value: text('value').notNull(),
+    expiresAt: timestamp('expires_at').notNull(),
+    createdAt: timestamp('created_at').$defaultFn(() => /* @__PURE__ */ new Date()),
+    updatedAt: timestamp('updated_at').$defaultFn(() => /* @__PURE__ */ new Date())
+});
+
+export const papers = pgTable("papers", {
+    id: text("id").primaryKey(),
+    arxivId: text("arxiv_id"),
+    title: text("title").notNull(),
+    abstract: text("abstract"),
+    summary: text("summary"),
+    pdfUrl: text("pdf_url"),
+    pdfData: text("pdf_data"), // Base64 encoded PDF as fallback when Redis is not available
+    fileHash: text("file_hash").unique(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  });
+  
+  export const paperChunks = pgTable("paper_chunks", {
+    id: uuid("id").defaultRandom().primaryKey(),
+    paperId: text("paper_id").references(() => papers.id, { onDelete: "cascade" }).notNull(),
+    content: text("content").notNull(),
+    // Jina v3 default dimension is 1024
+    embedding: vector("embedding", { dimensions: 1024 }), 
+  }, (table) => ({
+    embeddingIndex: index("embeddingIndex").using("hnsw", table.embedding.op("vector_cosine_ops")),
+  }));
+
+  export const chats = pgTable("chats", {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: text("user_id").references(() => user.id, { onDelete: "cascade" }).notNull(),
+    paperId: text("paper_id").references(() => papers.id, { onDelete: "cascade" }).notNull(),
+    title: text("title").notNull(), // e.g., "Conversation about Attention"
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const roleEnum = pgEnum("role", ["user", "assistant"]);
+
+export const messages = pgTable("messages", {
+    id: uuid("id").defaultRandom().primaryKey(),
+    chatId: uuid("chat_id").references(() => chats.id, { onDelete: "cascade" }).notNull(),
+    role: text("role", { enum: ["user", "assistant"] }).notNull(),
+    content: text("content").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+</file>
+
+<file path="src/modules/dashboard/ui/components/dashboard-navbar.tsx">
+"use client"
+
+import { Button } from "@/components/ui/button"
+import { useSidebar } from "@/components/ui/sidebar"
+import { PanelLeftCloseIcon, PanelLeftIcon, SearchIcon } from "lucide-react"
+import { DashboardCommand } from "./dashboard-command"
+import { useEffect, useState } from "react"
+import { useHeader } from "@/modules/dashboard/context/header-context" 
+
+export const DashboardNavbar = () => {
+    const { state, toggleSidebar, isMobile} = useSidebar();
+    const [commandOpen, setCommandOpen] = useState(false)
+    const { title } = useHeader(); // <--- Consume Context
+
+    useEffect(() => {
+        const down = (e: KeyboardEvent) => {
+            if(e.key === "k" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault()
+                setCommandOpen((open) => !open);
+            }
+        }; 
+
+        document.addEventListener("keydown", down);
+        return () => document.removeEventListener("keydown", down)
+    },[])
+
+    return (
+        <>
+            <DashboardCommand open={commandOpen} setOpen={setCommandOpen} />
+            <nav className="flex px-4 gap-x-2 items-center py-3 border-b bg-background h-14 shrink-0">
+                <Button className="size-9" variant={"outline"} onClick={toggleSidebar}>
+                    {(state === "collapsed" || isMobile) 
+                    ? <PanelLeftIcon className="size-4" /> 
+                    : <PanelLeftCloseIcon className="size-4" /> } 
+                </Button>
+
+                {/* DYNAMIC TITLE SECTION */}
+                {title ? (
+                    <div className="flex items-center ml-2 border-l pl-4 h-6 fade-in animate-in duration-300">
+                        <h2 className="font-semibold text-slate-900 text-sm truncate max-w-[400px] md:max-w-[700px]">
+                            {title}
+                        </h2>
+                    </div>
+                ) : (
+                    /* Default Search Button (Hide when title is present, or keep both if preferred) */
+                    <Button 
+                        variant={"outline"}
+                        size={"sm"}
+                        onClick={() => setCommandOpen((open) => !open)}
+                        className="h-9 w-[240px] justify-start font-normal text-muted-foreground hover:text-muted-foreground ml-2"
+                    >
+                        <SearchIcon className="mr-2 h-4 w-4" />
+                        Search Paper {title ? "Paper" : "Papers"}
+                        <kbd className="ml-auto pointer-events-none inline-flex h-5 select-none items-center gap-1 bg-muted border px-1.5 font-mono text-[10px] rounded font-medium text-muted-foreground">
+                            <span className="text-xs">&#8984;</span>K
+                        </kbd>
+                    </Button>
+                )}
+            </nav>
+        </>
+    )
+}
+</file>
+
+<file path="src/modules/dashboard/ui/components/dashboard-sidebar.tsx">
+"use client"
+
+import { useEffect, useState } from "react"
+import Link from "next/link"
+import Image from "next/image"
+import { usePathname } from "next/navigation"
+import { FileIcon, HomeIcon, StarIcon, MessageSquareText, ChevronRight, HistoryIcon, EditIcon, SearchIcon } from "lucide-react"
+import { Separator } from "@/components/ui/separator"
+import { cn } from "@/lib/utils"
+import { DashboardUserButton } from "./dashboard-user-button"
+import { groupChatsByDate } from "@/lib/grouped-history"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible" // <--- Import Collapsible
+
+import { 
+    Sidebar,
+    SidebarHeader,
+    SidebarContent,
+    SidebarFooter,
+    SidebarGroup,
+    SidebarGroupLabel,
+    SidebarGroupContent,
+    SidebarMenuItem,
+    SidebarMenu,
+    SidebarMenuButton,
+} from "@/components/ui/sidebar"
+
+const firstSection = [
+    {
+        icon: EditIcon,
+        label: "New Chat",
+        href: "/chat",
+    },
+    {
+        icon: SearchIcon,
+        label: "Search Papers",
+        href: "/search",
+    },
+]
+
+const secondSection = [
+    {
+        icon: StarIcon,
+        label: "Upgrade",
+        href: "/upgrade",
+    }
+]
+
+export const DashboardSidebar = () => {
+    const pathname = usePathname();
+    const [groupedHistory, setGroupedHistory] = useState<ReturnType<typeof groupChatsByDate>>([]);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        async function fetchHistory() {
+            try {
+                const res = await fetch("/api/history/sidebar");
+                if (res.ok) {
+                    const data = await res.json();
+                    const grouped = groupChatsByDate(data.history || []);
+                    setGroupedHistory(grouped);
+                }
+            } catch (error) {
+                console.error("Failed to load history", error);
+            } finally {
+                setLoading(false);
+            }
+        }
+        fetchHistory();
+    }, [pathname]);
+
+    return (
+        <Sidebar>
+            <SidebarHeader className="text-sidebar-accent-foreground">
+                <Link href={"/"} className="flex items-center gap-2 px-2 pt-2">
+                    <Image src={"/logo.svg"} alt="logo" width={36} height={36} />
+                    <p className="text-2xl font-semibold">Kluq.AI</p>
+                </Link>
+            </SidebarHeader>
+            
+            <div className="px-4 py-2">
+                <Separator className="opacity-10 text-[#5D6B68]" />
+            </div>
+
+            <SidebarContent>
+                {/* MAIN MENU */}
+                <SidebarGroup>
+                    <SidebarGroupContent>
+                        <SidebarMenu>
+                            {firstSection.map((item) => (
+                                <SidebarMenuItem key={item.href}>
+                                    <SidebarMenuButton 
+                                        asChild
+                                        className={cn(
+                                            "h-10 hover:bg-linear-to-r/oklch border border-transparent hover:border-[#5D6B68]/10 from-sidebar-accent from-5% via-30% via-sidebar/50 to-sidebar/50",
+                                            pathname === item.href && "bg-linear-to-r/oklch border-[#5D6B68]/10"
+                                        )}
+                                        isActive={pathname === item.href}
+                                    >
+                                        <Link href={item.href}>
+                                            <item.icon className="size-4" />
+                                            <span className="text-sm font-medium tracking-tight">{item.label}</span>
+                                        </Link>
+                                    </SidebarMenuButton>
+                                </SidebarMenuItem>
+                            ))}
+                        </SidebarMenu>
+                    </SidebarGroupContent>
+                </SidebarGroup>
+
+                {/* COLLAPSIBLE HISTORY SECTION */}
+                <Collapsible defaultOpen={false} className="group/collapsible ">
+                    <SidebarGroup>
+                        <SidebarGroupLabel asChild>
+                            <CollapsibleTrigger className="flex w-full py-3  items-center text-xs font-medium text-muted-foreground/70 hover:bg-sidebar-accent/50 hover:text-white transition-colors cursor-pointer">
+                                <HistoryIcon className="mr-2 size-4" />
+                                History
+                                <span className="ml-auto">
+                                    <ChevronRight className="mr-2 size-4 transition-transform group-data-[state=open]/collapsible:rotate-90" />
+                                </span>
+                            </CollapsibleTrigger>
+                        </SidebarGroupLabel>
+                        
+                        <CollapsibleContent>
+                            <SidebarGroupContent>
+                                {loading ? (
+                                    <div className="px-4 py-2 text-xs text-muted-foreground">Loading...</div>
+                                ) : groupedHistory.length === 0 ? (
+                                    <div className="px-4 py-2 text-xs text-muted-foreground">No recent chats</div>
+                                ) : (
+                                    groupedHistory.map((group) => (
+                                        <div key={group.label} className="mt-4 first:mt-1">
+                                            <div className="px-4 mb-1 text-[10px] font-semibold text-muted-foreground/50 uppercase tracking-wider">
+                                                {group.label}
+                                            </div>
+                                            <SidebarMenu>
+                                                {group.items.map((item) => (
+                                                    <SidebarMenuItem key={item.chatId}>
+                                                        <SidebarMenuButton 
+                                                            asChild 
+                                                            className={cn(
+                                                                "h-auto py-2 hover:bg-sidebar-accent/50 pl-8", // Added pl-8 for hierarchy indentation
+                                                                pathname === `/chat/${item.paperId}` && "bg-sidebar-accent text-sidebar-accent-foreground"
+                                                            )}
+                                                        >
+                                                            <Link href={`/chat/${item.paperId}`}>
+                                                                <MessageSquareText className="size-4 shrink-0" />
+                                                                <div className="flex flex-col gap-0.5 overflow-hidden min-w-0 flex-1">
+                                                                    <span className="truncate text-xs font-medium text-left block w-full cursor-pointer">
+                                                                        {item.paperTitle || "Untitled Paper"}
+                                                                    </span>
+                                                                </div>
+                                                            </Link>
+                                                        </SidebarMenuButton>
+                                                    </SidebarMenuItem>
+                                                ))}
+                                            </SidebarMenu>
+                                        </div>
+                                    ))
+                                )}
+                            </SidebarGroupContent>
+                        </CollapsibleContent>
+                    </SidebarGroup>
+                </Collapsible>
+
+                <div className="px-4 py-2 mt-auto">
+                    <Separator className="opacity-10 text-[#5D6B68]" />
+                </div>
+                
+                {/* BOTTOM SECTION */}
+                <SidebarGroup>
+                    <SidebarGroupContent>
+                        <SidebarMenu>
+                            {secondSection.map((item) => (
+                                <SidebarMenuItem key={item.href}>
+                                    <SidebarMenuButton 
+                                        asChild
+                                        className="h-10"
+                                    >
+                                        <Link href={item.href}>
+                                            <item.icon className="size-5" />
+                                            <span className="text-sm font-medium tracking-tight">{item.label}</span>
+                                        </Link>
+                                    </SidebarMenuButton>
+                                </SidebarMenuItem>
+                            ))}
+                        </SidebarMenu>
+                    </SidebarGroupContent>
+                </SidebarGroup>
+            </SidebarContent>
+            
+            <SidebarFooter className="text-white">
+                <DashboardUserButton />
+            </SidebarFooter>
+        </Sidebar>
+    )
+}
+</file>
+
 <file path="src/trpc/routers/_app.ts">
 import { z } from 'zod';
 import { baseProcedure, createTRPCRouter } from '../init';
@@ -8355,12 +9440,14 @@ export type AppRouter = typeof appRouter;
     "next-themes": "^0.4.6",
     "node-fetch": "^3.3.2",
     "pdf-parse": "^2.4.5",
-    "pdfjs-dist": "^5.4.394",
+    "pdfjs-dist": "^4.4.168",
     "react": "^19.0.0",
     "react-day-picker": "^9.8.0",
     "react-dom": "^19.0.0",
     "react-hook-form": "^7.60.0",
     "react-icons": "^5.5.0",
+    "react-markdown": "^10.1.0",
+    "react-pdf": "^10.2.0",
     "react-resizable-panels": "^3.0.3",
     "recharts": "^2.15.4",
     "redis": "^5.10.0",

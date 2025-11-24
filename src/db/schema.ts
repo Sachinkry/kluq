@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, boolean, uuid, vector, index, } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, uuid, vector, index, pgEnum, } from "drizzle-orm/pg-core";
 
 export const user = pgTable("user", {
     id: text('id').primaryKey(),
@@ -48,11 +48,13 @@ export const verification = pgTable("verification", {
 
 export const papers = pgTable("papers", {
     id: text("id").primaryKey(),
+    arxivId: text("arxiv_id"),
     title: text("title").notNull(),
     abstract: text("abstract"),
+    summary: text("summary"),
     pdfUrl: text("pdf_url"),
     pdfData: text("pdf_data"), // Base64 encoded PDF as fallback when Redis is not available
-    fileHash: text("file_hash"),
+    fileHash: text("file_hash").unique(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
   });
   
@@ -65,3 +67,21 @@ export const papers = pgTable("papers", {
   }, (table) => ({
     embeddingIndex: index("embeddingIndex").using("hnsw", table.embedding.op("vector_cosine_ops")),
   }));
+
+  export const chats = pgTable("chats", {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: text("user_id").references(() => user.id, { onDelete: "cascade" }).notNull(),
+    paperId: text("paper_id").references(() => papers.id, { onDelete: "cascade" }).notNull(),
+    title: text("title").notNull(), // e.g., "Conversation about Attention"
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const roleEnum = pgEnum("role", ["user", "assistant"]);
+
+export const messages = pgTable("messages", {
+    id: uuid("id").defaultRandom().primaryKey(),
+    chatId: uuid("chat_id").references(() => chats.id, { onDelete: "cascade" }).notNull(),
+    role: text("role", { enum: ["user", "assistant"] }).notNull(),
+    content: text("content").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+});
