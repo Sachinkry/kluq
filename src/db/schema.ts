@@ -53,6 +53,7 @@ export const papers = pgTable("papers", {
     abstract: text("abstract"),
     summary: text("summary"),
     pdfUrl: text("pdf_url"),
+    fullText: text("full_text"),
     pdfData: text("pdf_data"), // Base64 encoded PDF as fallback when Redis is not available
     fileHash: text("file_hash").unique(),
     createdAt: timestamp("created_at").defaultNow().notNull(),

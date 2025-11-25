@@ -31,7 +31,7 @@ export const ChatView = () => {
   } = useChat(id);
 
   return (
-    <div className="h-screen w-full bg-white overflow-hidden">
+    <div className="h-screen w-full bg-red-500 overflow-hidden">
       <ResizablePanelGroup direction="horizontal" className="h-full w-full">
         
         {/* LEFT PANEL: PDF */}

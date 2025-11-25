@@ -69,7 +69,7 @@ export const DashboardSidebar = () => {
     }, [pathname]);
 
     return (
-        <Sidebar>
+        <Sidebar className="border-none">
             <SidebarHeader className="text-sidebar-accent-foreground">
                 <Link href={"/"} className="flex items-center gap-2 px-2 pt-2">
                     <Image src={"/logo.svg"} alt="logo" width={36} height={36} />

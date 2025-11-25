@@ -22,6 +22,7 @@ export const PDFViewer = ({ url, loading }: PDFViewerProps) => {
             data={url}
             type="application/pdf"
             className="w-full h-full block"
+            style={{ colorScheme: "light" }}
           >
             {/* Fallback for browsers that don't support PDF embedding */}
             <div className="flex flex-col items-center justify-center h-full text-slate-500 gap-2">
