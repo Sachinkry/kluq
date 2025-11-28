@@ -4,7 +4,8 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { MessageSquare, Loader2, Calendar, ExternalLink, ChevronDown, ChevronUp, BotIcon } from "lucide-react";
+// 1. IMPORT THE NETWORK ICON
+import { MessageSquare, Loader2, Calendar, ExternalLink, ChevronDown, ChevronUp, BotIcon, Network } from "lucide-react";
 import { format } from "date-fns";
 import { cn } from "@/lib/utils";
 
@@ -21,13 +22,12 @@ export interface Paper {
 export function PaperCard({ paper }: { paper: Paper }) {
   const router = useRouter();
   const [isLoading, setIsLoading] = useState(false);
-  const [isExpanded, setIsExpanded] = useState(false); // State for See More/Less
+  const [isExpanded, setIsExpanded] = useState(false); 
 
   const handleChatClick = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
       setIsLoading(true);
-      
       const res = await fetch("/api/pdf/load", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -37,7 +37,6 @@ export function PaperCard({ paper }: { paper: Paper }) {
       if (!res.ok) throw new Error("Failed to load paper");
       const data = await res.json();
       router.push(`/chat/${data.pdfId}`);
-      
     } catch (error) {
       console.error("Error loading paper:", error);
       setIsLoading(false); 
@@ -51,7 +50,6 @@ export function PaperCard({ paper }: { paper: Paper }) {
   return (
     <div className="group border border-slate-200 rounded-xl p-5 hover:shadow-md transition-all bg-white hover:border-emerald-200/50 flex flex-col gap-4">
       
-      {/* TOP ROW: Metadata & Actions */}
       <div className="flex justify-between items-start gap-4">
         <div className="flex-1 space-y-2">
           <div className="flex items-center gap-2 text-xs text-muted-foreground flex-wrap">
@@ -80,30 +78,43 @@ export function PaperCard({ paper }: { paper: Paper }) {
           </p>
         </div>
 
+        {/* ACTIONS COLUMN */}
         <div className="flex flex-col gap-2 shrink-0">
             <Button 
-            size="sm" 
-            onClick={handleChatClick} 
-            disabled={isLoading}
-            className="bg-slate-900 text-white hover:bg-emerald-600 hover:cursor-pointer transition-colors shadow-none h-9 px-4"
+                size="sm" 
+                onClick={handleChatClick} 
+                disabled={isLoading}
+                className="bg-slate-900 text-white hover:bg-emerald-600 transition-colors shadow-none h-9 px-4"
             >
-            {isLoading ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            ) : (
-                // <MessageSquare className="mr-2 h-4 w-4" />
-                <BotIcon className="mr-1 size-5" />
-            )}
-            {isLoading ? "..." : "Chat"}
+                {isLoading ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                    <BotIcon className="mr-2 h-4 w-4" />
+                )}
+                {isLoading ? "..." : "Chat"}
+            </Button>
+
+            {/* 2. ADD GRAPH BUTTON */}
+            <Button
+                size="sm"
+                variant="outline"
+                onClick={(e) => {
+                    e.stopPropagation();
+                    router.push(`/graph?paperId=${paper.id}`);
+                }}
+                className="h-9 px-4 text-slate-600 hover:text-emerald-700 hover:bg-emerald-50 hover:border-emerald-200"
+            >
+                <Network className="mr-2 h-4 w-4" />
+                Graph
             </Button>
         </div>
       </div>
 
-      {/* BOTTOM: Abstract with "See More" */}
       <div className="relative">
         <p 
             className={cn(
                 "text-slate-600 text-sm leading-relaxed transition-all",
-                !isExpanded && "line-clamp-5" // Truncate if not expanded
+                !isExpanded && "line-clamp-3"
             )}
         >
             {paper.abstract}
@@ -124,7 +135,6 @@ export function PaperCard({ paper }: { paper: Paper }) {
                 )}
             </button>
 
-            {/* PDF Link */}
             <a href={paper.pdfUrl} target="_blank" className="text-xs font-medium text-slate-400 hover:text-emerald-600 flex items-center gap-1 transition-colors">
                 <ExternalLink className="h-3 w-3" />
                 Original PDF

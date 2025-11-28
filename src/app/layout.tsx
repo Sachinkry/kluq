@@ -23,7 +23,7 @@ export default function RootLayout({
     <TRPCReactProvider>
       <html lang="en">
         <body
-          className={`${inter.variable} antialiased`}
+          className={`${inter.variable} antialiased flex h-screen w-screen`}
           >
           {children}
         </body>

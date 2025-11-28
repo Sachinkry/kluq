@@ -4,7 +4,7 @@ import { useEffect, useState } from "react"
 import Link from "next/link"
 import Image from "next/image"
 import { usePathname } from "next/navigation"
-import { FileIcon, HomeIcon, StarIcon, MessageSquareText, ChevronRight, HistoryIcon, EditIcon, SearchIcon } from "lucide-react"
+import { FileIcon, HomeIcon, StarIcon, MessageSquareText, ChevronRight, HistoryIcon, EditIcon, SearchIcon, NetworkIcon, CompassIcon } from "lucide-react"
 import { Separator } from "@/components/ui/separator"
 import { cn } from "@/lib/utils"
 import { DashboardUserButton } from "./dashboard-user-button"
@@ -31,10 +31,20 @@ const firstSection = [
         href: "/chat",
     },
     {
+        icon: CompassIcon,
+        label: "Explore",
+        href: "/explore",
+    },
+    {
         icon: SearchIcon,
         label: "Search Papers",
         href: "/search",
     },
+    {
+        icon: NetworkIcon,
+        label: "View Graph",
+        href: "/graph",
+    }
 ]
 
 const secondSection = [
@@ -108,7 +118,7 @@ export const DashboardSidebar = () => {
                 </SidebarGroup>
 
                 {/* COLLAPSIBLE HISTORY SECTION */}
-                <Collapsible defaultOpen={false} className="group/collapsible ">
+                <Collapsible defaultOpen={true} className="group/collapsible ">
                     <SidebarGroup>
                         <SidebarGroupLabel asChild>
                             <CollapsibleTrigger className="flex w-full py-3  items-center text-xs font-medium text-muted-foreground/70 hover:bg-sidebar-accent/50 hover:text-white transition-colors cursor-pointer">
@@ -128,32 +138,34 @@ export const DashboardSidebar = () => {
                                     <div className="px-4 py-2 text-xs text-muted-foreground">No recent chats</div>
                                 ) : (
                                     groupedHistory.map((group) => (
-                                        <div key={group.label} className="mt-4 first:mt-1">
+                                        <div key={group.label} className="mt-4 first:mt-1 ">
                                             <div className="px-4 mb-1 text-[10px] font-semibold text-muted-foreground/50 uppercase tracking-wider">
                                                 {group.label}
                                             </div>
-                                            <SidebarMenu>
-                                                {group.items.map((item) => (
-                                                    <SidebarMenuItem key={item.chatId}>
-                                                        <SidebarMenuButton 
-                                                            asChild 
-                                                            className={cn(
-                                                                "h-auto py-2 hover:bg-sidebar-accent/50 pl-8", // Added pl-8 for hierarchy indentation
-                                                                pathname === `/chat/${item.paperId}` && "bg-sidebar-accent text-sidebar-accent-foreground"
-                                                            )}
-                                                        >
-                                                            <Link href={`/chat/${item.paperId}`}>
-                                                                <MessageSquareText className="size-4 shrink-0" />
-                                                                <div className="flex flex-col gap-0.5 overflow-hidden min-w-0 flex-1">
-                                                                    <span className="truncate text-xs font-medium text-left block w-full cursor-pointer">
-                                                                        {item.paperTitle || "Untitled Paper"}
-                                                                    </span>
-                                                                </div>
-                                                            </Link>
-                                                        </SidebarMenuButton>
-                                                    </SidebarMenuItem>
-                                                ))}
-                                            </SidebarMenu>
+                                            <div className="ml-2 pr-2 w-full">
+                                                <SidebarMenu>
+                                                    {group.items.map((item) => (
+                                                        <SidebarMenuItem key={item.chatId}>
+                                                                <SidebarMenuButton 
+                                                                    asChild 
+                                                                    className={cn(
+                                                                        "h-auto py-2 hover:bg-sidebar-accent/50 ", // Added pl-8 for hierarchy indentation
+                                                                        pathname === `/chat/${item.paperId}` && "bg-sidebar-accent text-sidebar-accent-foreground"
+                                                                    )}
+                                                                    >
+                                                                    <Link href={`/chat/${item.paperId}`}>
+                                                                        {/* <MessageSquareText className="size-4 shrink-0" /> */}
+                                                                        <div className="flex flex-col gap-0.1 w-full overflow-hidden min-w-0 flex-1">
+                                                                            <span className="truncate text-xs font-medium text-left block w-full cursor-pointer">
+                                                                                {item.paperTitle || "Untitled Paper"}
+                                                                            </span>
+                                                                        </div>
+                                                                    </Link>
+                                                                </SidebarMenuButton>
+                                                        </SidebarMenuItem>
+                                                    ))}
+                                                </SidebarMenu>
+                                            </div>
                                         </div>
                                     ))
                                 )}

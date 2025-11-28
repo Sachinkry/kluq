@@ -2,9 +2,8 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { streamText } from "ai";
 import { NextResponse } from "next/server";
 import { db } from "@/db";
-import { paperChunks, chats, messages } from "@/db/schema";
-import { generateEmbedding } from "@/lib/embed";
-import { desc, gt, sql, eq, and } from "drizzle-orm";
+import { papers, chats, messages } from "@/db/schema"; // Removed paperChunks
+import { eq, and } from "drizzle-orm"; // Removed desc, gt, sql
 import { auth } from "@/lib/auth"; 
 import { headers } from "next/headers";
 
@@ -56,14 +55,12 @@ export async function POST(req: Request) {
       if (existingChat.length > 0) {
         chatId = existingChat[0].id;
         
-        // FIX: Update title if it's still the default "New Conversation"
         if (existingChat[0].title === "New Conversation") {
           await db.update(chats)
             .set({ title: titleSnippet })
             .where(eq(chats.id, chatId));
         }
       } else {
-        // Create new if missing
         const newChat = await db.insert(chats).values({
           userId: session.user.id,
           paperId: pdfId,
@@ -79,26 +76,33 @@ export async function POST(req: Request) {
       content: query,
     });
 
-    // 4. RAG: Embed & Search
-    const queryVector = await generateEmbedding(query);
-    const similarity = sql<number>`1 - (${paperChunks.embedding} <=> ${JSON.stringify(queryVector)})`;
+    // 4. FULL CONTEXT FETCH (Replaces RAG)
+    // We fetch the entire paper text directly from Postgres.
+    // Gemini 1.5 Flash handles this easily (up to ~700k words).
+    const paperRecord = await db
+      .select({ fullText: papers.fullText })
+      .from(papers)
+      .where(eq(papers.id, pdfId))
+      .limit(1);
 
-    const relevantChunks = await db
-      .select({ content: paperChunks.content, score: similarity })
-      .from(paperChunks)
-      .where(and(eq(paperChunks.paperId, pdfId), gt(similarity, 0.1)))
-      .orderBy(desc(similarity))
-      .limit(15);
+    const fullPaperText = paperRecord[0]?.fullText || "";
 
-    const context = relevantChunks.map((c) => c.content).join("\n\n");
-
-    // 5. Stream Response & Save ASSISTANT Message
+    // 5. Stream Response with REFINED PROMPT
     const result = await streamText({
       model: google("gemini-2.5-flash"),
-      system: `You are a helpful research assistant... CONTEXT: ${context || "No context found."}`,
+      // STRICT SYSTEM PROMPT
+      system: `You are a senior researcher assisting a user with a specific academic paper. 
+      
+      CORE INSTRUCTIONS:
+      1. **Answer directly:** Do not start with "Based on the paper..." or "The document states...". Just answer.
+      2. **Be concise:** If the user asks a simple question (e.g., "What is the accuracy?"), give a 1-sentence answer. Do not summarize the whole paper unless asked.
+      3. **Stay grounded:** Use ONLY the provided paper text. If the answer isn't there, say "I cannot find that information in this paper."
+      4. **Formatting:** Use Markdown. Use bullet points for lists. Bold key metrics.
+      
+      FULL PAPER TEXT:
+      ${fullPaperText}`,
       messages: chatMessages.map((m: any) => ({ role: m.role, content: m.content })),
       onFinish: async ({ text }) => {
-        // Save the AI's full response to DB when stream finishes
         if (text) {
           await db.insert(messages).values({
             chatId: chatId,

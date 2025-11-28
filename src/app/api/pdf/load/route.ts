@@ -29,12 +29,22 @@ export async function POST(req: Request) {
     let paperTitle = `arXiv ${cleanId}`;
     let paperAbstract = "";
     try {
-      const metaRes = await fetch(`http://export.arxiv.org/api/query?id_list=${cleanId}`);
-      const parsed = await xml2js.parseStringPromise(await metaRes.text(), { explicitArray: false });
-      const entry = Array.isArray(parsed?.feed?.entry) ? parsed.feed.entry[0] : parsed?.feed?.entry;
-      if (entry?.title) {
-        paperTitle = entry.title.replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-        paperAbstract = entry.summary?.trim() || "No abstract available.";
+      // FIX: Use HTTPS + User-Agent
+      const metaRes = await fetch(`https://export.arxiv.org/api/query?id_list=${cleanId}`, {
+        headers: {
+            "User-Agent": "Kluq-AI-Research/1.0 (mailto:admin@kluq.ai)"
+        }
+      });
+      
+      const xml = await metaRes.text();
+      // Ensure we got XML back before parsing
+      if (xml.includes("<feed")) {
+          const parsed = await xml2js.parseStringPromise(xml, { explicitArray: false });
+          const entry = Array.isArray(parsed?.feed?.entry) ? parsed.feed.entry[0] : parsed?.feed?.entry;
+          if (entry?.title) {
+            paperTitle = entry.title.replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+            paperAbstract = entry.summary?.trim() || "No abstract available.";
+          }
       }
     } catch (e) { console.error("Meta fetch failed", e); }
 
@@ -47,8 +57,16 @@ export async function POST(req: Request) {
     } else {
       // Download & Process
       const targetUrl = `https://arxiv.org/pdf/${cleanId}.pdf`;
-      const pdfRes = await fetch(targetUrl);
-      if (!pdfRes.ok) throw new Error("Failed to fetch PDF");
+      const pdfRes = await fetch(targetUrl,{
+        headers: {
+          "User-Agent": "Kluq-AI-Research/1.0 (mailto:heysachinkry@gmail.com)"
+        }}
+      );
+      
+      const contentType = pdfRes.headers.get("content-type");
+      if (!pdfRes.ok || (contentType && !contentType.includes("pdf"))) {
+         throw new Error("Failed to fetch valid PDF. ArXiv might be rate-limiting.");
+      }
       const buffer = Buffer.from(await pdfRes.arrayBuffer());
       
       const fileHash = createHash("sha256").update(buffer).digest("hex");

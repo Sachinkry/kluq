@@ -12,20 +12,36 @@ export async function GET(req: Request) {
     return NextResponse.json({ results: [] });
   }
 
-  // Construct Query
   let searchQuery = `all:${encodeURIComponent(q)}`;
   if (category !== "all") {
     searchQuery += `+AND+cat:${category}`;
   }
 
   const maxResults = 10;
-  const url = `http://export.arxiv.org/api/query?search_query=${searchQuery}&start=0&max_results=${maxResults}&sortBy=${sortBy}&sortOrder=${sortOrder}`;
+  // FIX 1: Use HTTPS
+  const url = `https://export.arxiv.org/api/query?search_query=${searchQuery}&start=0&max_results=${maxResults}&sortBy=${sortBy}&sortOrder=${sortOrder}`;
 
   try {
-    const response = await fetch(url);
+    // FIX 2: Add User-Agent header (Required by ArXiv)
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Kluq-AI-Research/1.0 (mailto:admin@kluq.ai)"
+      }
+    });
+
+    if (!response.ok) {
+        throw new Error(`ArXiv API Error: ${response.status} ${response.statusText}`);
+    }
+
     const xml = await response.text();
-    const parsed = await xml2js.parseStringPromise(xml, { explicitArray: false });
     
+    // Safety check: ensure response is actually XML before parsing
+    if (xml.trim().startsWith("R") || !xml.includes("<feed")) {
+        console.warn("ArXiv Rate Limit/Error:", xml);
+        return NextResponse.json({ results: [] });
+    }
+
+    const parsed = await xml2js.parseStringPromise(xml, { explicitArray: false });
     const entries = parsed.feed.entry ? (Array.isArray(parsed.feed.entry) ? parsed.feed.entry : [parsed.feed.entry]) : [];
 
     const results = entries.map((e: any) => {
@@ -34,21 +50,14 @@ export async function GET(req: Request) {
             : [e.category?.$.term];
 
         return {
-            // 1. Fix ID
             id: e.id.replace(/http:\/\/arxiv\.org\/abs\//g, "").replace(/https:\/\/arxiv\.org\/abs\//g, "").replace("v1", ""),
-            
             title: e.title?.replace(/\n/g, " ").trim(),
-            
-            // 2. FIX: Map 'summary' to 'abstract' to match UI component
             abstract: e.summary?.trim() || "No abstract available.",
-            
-            // 3. Fix Authors (Ensure it is a string, not array/object)
             authors: e.author 
                 ? (Array.isArray(e.author) 
                     ? e.author.map((a: any) => a.name).join(", ") 
                     : e.author.name)
                 : "Unknown",
-            
             published: e.published,
             updated: e.updated,
             categories: categories,
